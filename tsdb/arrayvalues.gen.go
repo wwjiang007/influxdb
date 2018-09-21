@@ -31,6 +31,9 @@ func (a *FloatArray) Size() int {
 }
 
 func (a *FloatArray) Len() int {
+	if a == nil {
+		return 0
+	}
 	return len(a.Timestamps)
 }
 
@@ -232,6 +235,9 @@ func (a *IntegerArray) Size() int {
 }
 
 func (a *IntegerArray) Len() int {
+	if a == nil {
+		return 0
+	}
 	return len(a.Timestamps)
 }
 
@@ -433,6 +439,9 @@ func (a *UnsignedArray) Size() int {
 }
 
 func (a *UnsignedArray) Len() int {
+	if a == nil {
+		return 0
+	}
 	return len(a.Timestamps)
 }
 
@@ -634,6 +643,9 @@ func (a *StringArray) Size() int {
 }
 
 func (a *StringArray) Len() int {
+	if a == nil {
+		return 0
+	}
 	return len(a.Timestamps)
 }
 
@@ -835,6 +847,9 @@ func (a *BooleanArray) Size() int {
 }
 
 func (a *BooleanArray) Len() int {
+	if a == nil {
+		return 0
+	}
 	return len(a.Timestamps)
 }
 

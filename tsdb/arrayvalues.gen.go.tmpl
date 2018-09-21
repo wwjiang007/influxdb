@@ -29,6 +29,9 @@ func (a *{{ $typename }}) Size() int {
 }
 
 func (a *{{ $typename}}) Len() int {
+	if a == nil {
+		return 0
+	}
 	return len(a.Timestamps)
 }
 
