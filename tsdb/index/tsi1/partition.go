@@ -1,6 +1,7 @@
 package tsi1
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,11 +15,11 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/influxdata/influxdb/logger"
-	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/pkg/bytesutil"
-	"github.com/influxdata/influxdb/pkg/estimator"
-	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/v2/logger"
+	"github.com/influxdata/influxdb/v2/models"
+	"github.com/influxdata/influxdb/v2/pkg/bytesutil"
+	"github.com/influxdata/influxdb/v2/pkg/estimator"
+	"github.com/influxdata/influxdb/v2/tsdb"
 	"github.com/influxdata/influxql"
 	"go.uber.org/zap"
 )
@@ -58,10 +59,11 @@ type Partition struct {
 	// Close management.
 	once    sync.Once
 	closing chan struct{} // closing is used to inform iterators the partition is closing.
-	wg      sync.WaitGroup
 
 	// Fieldset shared with engine.
 	fieldset *tsdb.MeasurementFieldSet
+
+	currentCompactionN int // counter of in-progress compactions
 
 	// Directory of the Partition's index files.
 	path string
@@ -123,7 +125,7 @@ func (p *Partition) bytes() int {
 	}
 	b += 12 // once sync.Once is 12 bytes
 	b += int(unsafe.Sizeof(p.closing))
-	b += 16 // wg sync.WaitGroup is 16 bytes
+	b += int(unsafe.Sizeof(p.currentCompactionN))
 	b += int(unsafe.Sizeof(p.fieldset)) + p.fieldset.Bytes()
 	b += int(unsafe.Sizeof(p.path)) + len(p.path)
 	b += int(unsafe.Sizeof(p.id)) + len(p.id)
@@ -322,9 +324,24 @@ func (p *Partition) buildSeriesSet() error {
 	return nil
 }
 
-// Wait returns once outstanding compactions have finished.
+// CurrentCompactionN returns the number of compactions currently running.
+func (p *Partition) CurrentCompactionN() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.currentCompactionN
+}
+
+// Wait will block until all compactions are finished.
+// Must only be called while they are disabled.
 func (p *Partition) Wait() {
-	p.wg.Wait()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if p.CurrentCompactionN() == 0 {
+			return
+		}
+		<-ticker.C
+	}
 }
 
 // Close closes the index.
@@ -334,7 +351,7 @@ func (p *Partition) Close() error {
 		close(p.closing)
 		close(p.compactionInterrupt)
 	})
-	p.wg.Wait()
+	p.Wait()
 
 	// Lock index and close remaining
 	p.mu.Lock()
@@ -427,7 +444,7 @@ func (p *Partition) FieldSet() *tsdb.MeasurementFieldSet {
 func (p *Partition) RetainFileSet() (*FileSet, error) {
 	select {
 	case <-p.closing:
-		return nil, errors.New("index is closing")
+		return nil, tsdb.ErrIndexClosing
 	default:
 		p.mu.RLock()
 		defer p.mu.RUnlock()
@@ -610,7 +627,11 @@ func (p *Partition) DropMeasurement(name []byte) error {
 			} else if elem.SeriesID == 0 {
 				break
 			}
-			if err := p.activeLogFile.DeleteSeriesID(elem.SeriesID); err != nil {
+			if err := func() error {
+				p.mu.RLock()
+				defer p.mu.RUnlock()
+				return p.activeLogFile.DeleteSeriesID(elem.SeriesID)
+			}(); err != nil {
 				return err
 			}
 		}
@@ -671,7 +692,11 @@ func (p *Partition) createSeriesListIfNotExists(names [][]byte, tagsSlice []mode
 
 func (p *Partition) DropSeries(seriesID uint64) error {
 	// Delete series from index.
-	if err := p.activeLogFile.DeleteSeriesID(seriesID); err != nil {
+	if err := func() error {
+		p.mu.RLock()
+		defer p.mu.RUnlock()
+		return p.activeLogFile.DeleteSeriesID(seriesID)
+	}(); err != nil {
 		return err
 	}
 
@@ -754,18 +779,21 @@ func (p *Partition) TagValueIterator(name, key []byte) tsdb.TagValueIterator {
 }
 
 // TagKeySeriesIDIterator returns a series iterator for all values across a single key.
-func (p *Partition) TagKeySeriesIDIterator(name, key []byte) tsdb.SeriesIDIterator {
+func (p *Partition) TagKeySeriesIDIterator(name, key []byte) (tsdb.SeriesIDIterator, error) {
 	fs, err := p.RetainFileSet()
 	if err != nil {
-		return nil // TODO(edd): this should probably return an error.
+		return nil, err
 	}
 
-	itr := fs.TagKeySeriesIDIterator(name, key)
-	if itr == nil {
+	itr, err := fs.TagKeySeriesIDIterator(name, key)
+	if err != nil {
 		fs.Release()
-		return nil
+		return nil, err
+	} else if itr == nil {
+		fs.Release()
+		return nil, nil
 	}
-	return newFileSetSeriesIDIterator(fs, itr)
+	return newFileSetSeriesIDIterator(fs, itr), nil
 }
 
 // TagValueSeriesIDIterator returns a series iterator for a single key value.
@@ -777,6 +805,7 @@ func (p *Partition) TagValueSeriesIDIterator(name, key, value []byte) (tsdb.Seri
 
 	itr, err := fs.TagValueSeriesIDIterator(name, key, value)
 	if err != nil {
+		fs.Release()
 		return nil, err
 	} else if itr == nil {
 		fs.Release()
@@ -906,7 +935,7 @@ func (p *Partition) compact() {
 		// Execute in closure to save reference to the group within the loop.
 		func(files []*IndexFile, level int) {
 			// Start compacting in a separate goroutine.
-			p.wg.Add(1)
+			p.currentCompactionN++
 			go func() {
 
 				// Compact to a new level.
@@ -915,8 +944,8 @@ func (p *Partition) compact() {
 				// Ensure compaction lock for the level is released.
 				p.mu.Lock()
 				p.levelCompacting[level] = false
+				p.currentCompactionN--
 				p.mu.Unlock()
-				p.wg.Done()
 
 				// Check for new compactions
 				p.Compact()
@@ -932,7 +961,7 @@ func (p *Partition) compactToLevel(files []*IndexFile, level int, interrupt <-ch
 	assert(level > 0, "cannot compact level zero")
 
 	// Build a logger for this compaction.
-	log, logEnd := logger.NewOperation(p.logger, "TSI level compaction", "tsi1_compact_to_level", zap.Int("tsi1_level", level))
+	log, logEnd := logger.NewOperation(context.TODO(), p.logger, "TSI level compaction", "tsi1_compact_to_level", zap.Int("tsi1_level", level))
 	defer logEnd()
 
 	// Check for cancellation.
@@ -1065,10 +1094,14 @@ func (p *Partition) checkLogFile() error {
 	}
 
 	// Begin compacting in a background goroutine.
-	p.wg.Add(1)
+	p.currentCompactionN++
 	go func() {
-		defer p.wg.Done()
 		p.compactLogFile(logFile)
+
+		p.mu.Lock()
+		p.currentCompactionN-- // compaction is now complete
+		p.mu.Unlock()
+
 		p.Compact() // check for new compactions
 	}()
 
@@ -1094,7 +1127,7 @@ func (p *Partition) compactLogFile(logFile *LogFile) {
 	assert(id != 0, "cannot parse log file id: %s", logFile.Path())
 
 	// Build a logger for this compaction.
-	log, logEnd := logger.NewOperation(p.logger, "TSI log compaction", "tsi1_compact_log_file", zap.Int("tsi1_log_file_id", id))
+	log, logEnd := logger.NewOperation(context.TODO(), p.logger, "TSI log compaction", "tsi1_compact_log_file", zap.Int("tsi1_log_file_id", id))
 	defer logEnd()
 
 	// Create new index file.
@@ -1228,7 +1261,7 @@ func NewManifest(path string) *Manifest {
 		Version: Version,
 		path:    path,
 	}
-	copy(m.Levels, DefaultCompactionLevels[:])
+	copy(m.Levels, DefaultCompactionLevels)
 	return m
 }
 

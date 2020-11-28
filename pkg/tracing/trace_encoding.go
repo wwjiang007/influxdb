@@ -5,9 +5,9 @@ import (
 	"time"
 
 	"github.com/gogo/protobuf/proto"
-	"github.com/influxdata/influxdb/pkg/tracing/fields"
-	"github.com/influxdata/influxdb/pkg/tracing/labels"
-	"github.com/influxdata/influxdb/pkg/tracing/wire"
+	"github.com/influxdata/influxdb/v2/pkg/tracing/fields"
+	"github.com/influxdata/influxdb/v2/pkg/tracing/labels"
+	"github.com/influxdata/influxdb/v2/pkg/tracing/wire"
 )
 
 func fieldsToWire(set fields.Fields) []wire.Field {

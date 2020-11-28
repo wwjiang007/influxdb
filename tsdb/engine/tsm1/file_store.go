@@ -17,12 +17,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/pkg/file"
-	"github.com/influxdata/influxdb/pkg/limiter"
-	"github.com/influxdata/influxdb/pkg/metrics"
-	"github.com/influxdata/influxdb/query"
-	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/v2/influxql/query"
+	"github.com/influxdata/influxdb/v2/models"
+	"github.com/influxdata/influxdb/v2/pkg/file"
+	"github.com/influxdata/influxdb/v2/pkg/limiter"
+	"github.com/influxdata/influxdb/v2/pkg/metrics"
+	"github.com/influxdata/influxdb/v2/tsdb"
 	"go.uber.org/zap"
 )
 
@@ -298,7 +298,7 @@ func (f *FileStore) Count() int {
 }
 
 // Files returns the slice of TSM files currently loaded. This is only used for
-// tests, and the files aren't guaranteed to stay valid in the presense of compactions.
+// tests, and the files aren't guaranteed to stay valid in the presence of compactions.
 func (f *FileStore) Files() []TSMFile {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -482,21 +482,31 @@ func (f *FileStore) Open() error {
 	if err != nil {
 		return err
 	}
-	ext := fmt.Sprintf(".%s", TmpTSMFileExtension)
+
+	// ascertain the current temp directory number by examining the existing
+	// directories and choosing the one with the higest basename when converted
+	// to an integer.
 	for _, fi := range tmpfiles {
-		if fi.IsDir() && strings.HasSuffix(fi.Name(), ext) {
-			ss := strings.Split(filepath.Base(fi.Name()), ".")
-			if len(ss) == 2 {
-				if i, err := strconv.Atoi(ss[0]); err != nil {
-					if i > f.currentTempDirID {
-						f.currentTempDirID = i
-					}
-				}
-			}
+		if !fi.IsDir() || !strings.HasSuffix(fi.Name(), "."+TmpTSMFileExtension) {
+			continue
 		}
+
+		ss := strings.Split(filepath.Base(fi.Name()), ".")
+		if len(ss) != 2 {
+			continue
+		}
+
+		i, err := strconv.Atoi(ss[0])
+		if err != nil || i <= f.currentTempDirID {
+			continue
+		}
+
+		// i must be a valid integer and greater than f.currentTempDirID at this
+		// point
+		f.currentTempDirID = i
 	}
 
-	files, err := filepath.Glob(filepath.Join(f.dir, fmt.Sprintf("*.%s", TSMFileExtension)))
+	files, err := filepath.Glob(filepath.Join(f.dir, "*."+TSMFileExtension))
 	if err != nil {
 		return err
 	}
@@ -542,11 +552,14 @@ func (f *FileStore) Open() error {
 			// the file, and continue loading the shard without it.
 			if err != nil {
 				f.logger.Error("Cannot read corrupt tsm file, renaming", zap.String("path", file.Name()), zap.Int("id", idx), zap.Error(err))
+				file.Close()
 				if e := os.Rename(file.Name(), file.Name()+"."+BadTSMFileExtension); e != nil {
 					f.logger.Error("Cannot rename corrupt tsm file", zap.String("path", file.Name()), zap.Int("id", idx), zap.Error(e))
 					readerC <- &res{r: df, err: fmt.Errorf("cannot rename corrupt file %s: %v", file.Name(), e)}
 					return
 				}
+				readerC <- &res{r: df, err: fmt.Errorf("cannot read corrupt file %s: %v", file.Name(), err)}
+				return
 			}
 
 			df.WithObserver(f.obs)
@@ -729,17 +742,25 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
 			return err
 		}
 
-		var newName = file
-		if strings.HasSuffix(file, tsmTmpExt) {
+		var oldName, newName = file, file
+		if strings.HasSuffix(oldName, tsmTmpExt) {
 			// The new TSM files have a tmp extension.  First rename them.
 			newName = file[:len(file)-4]
-			if err := os.Rename(file, newName); err != nil {
+			if err := os.Rename(oldName, newName); err != nil {
 				return err
 			}
 		}
 
+		// Any error after this point should result in the file being bein named
+		// back to the original name. The caller then has the opportunity to
+		// remove it.
 		fd, err := os.Open(newName)
 		if err != nil {
+			if newName != oldName {
+				if err1 := os.Rename(newName, oldName); err1 != nil {
+					return err1
+				}
+			}
 			return err
 		}
 
@@ -752,6 +773,11 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
 
 		tsm, err := NewTSMReader(fd, WithMadviseWillNeed(f.tsmMMAPWillNeed))
 		if err != nil {
+			if newName != oldName {
+				if err1 := os.Rename(newName, oldName); err1 != nil {
+					return err1
+				}
+			}
 			return err
 		}
 		tsm.WithObserver(f.obs)
@@ -908,7 +934,9 @@ func (f *FileStore) BlockCount(path string, idx int) int {
 				}
 			}
 			_, _, _, _, _, block, _ := iter.Read()
-			return BlockCount(block)
+			// on Error, BlockCount(block) returns 0 for cnt
+			cnt, _ := BlockCount(block)
+			return cnt
 		}
 	}
 	return 0

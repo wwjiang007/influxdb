@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	"github.com/golang/snappy"
-	"github.com/influxdata/influxdb/pkg/slices"
-	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
+	"github.com/influxdata/influxdb/v2/pkg/slices"
+	"github.com/influxdata/influxdb/v2/tsdb/engine/tsm1"
 )
 
 func TestWALWriter_WriteMulti_Single(t *testing.T) {
@@ -167,7 +167,7 @@ func TestWALWriter_WriteMulti_Multiple(t *testing.T) {
 		}
 	}
 
-	// Seek back to the beinning of the file for reading
+	// Seek back to the beginning of the file for reading
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		fatal(t, "seek", err)
 	}
@@ -294,7 +294,7 @@ func TestWALWriter_WriteMultiDelete_Multiple(t *testing.T) {
 		fatal(t, "flush", err)
 	}
 
-	// Seek back to the beinning of the file for reading
+	// Seek back to the beginning of the file for reading
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		fatal(t, "seek", err)
 	}
@@ -393,7 +393,7 @@ func TestWALWriter_WriteMultiDeleteRange_Multiple(t *testing.T) {
 		fatal(t, "flush", err)
 	}
 
-	// Seek back to the beinning of the file for reading
+	// Seek back to the beginning of the file for reading
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		fatal(t, "seek", err)
 	}

@@ -3,7 +3,7 @@ package tsm1
 // Compactions are the process of creating read-optimized TSM files.
 // The files are created by converting write-optimized WAL entries
 // to read-optimized TSM format.  They can also be created from existing
-// TSM files when there are tombstone records that neeed to be removed, points
+// TSM files when there are tombstone records that need to be removed, points
 // that were overwritten by later writes and need to updated, or multiple
 // smaller TSM files need to be merged to reduce file counts and improve
 // compression ratios.
@@ -21,12 +21,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/influxdata/influxdb/pkg/limiter"
-	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/v2/pkg/limiter"
+	"github.com/influxdata/influxdb/v2/tsdb"
 )
 
 const maxTSMFileSize = uint32(2048 * 1024 * 1024) // 2GB
@@ -68,6 +69,18 @@ func (e errCompactionAborted) Error() string {
 	return "compaction aborted"
 }
 
+type errBlockRead struct {
+	file string
+	err  error
+}
+
+func (e errBlockRead) Error() string {
+	if e.err != nil {
+		return fmt.Sprintf("block read error on %s: %s", e.file, e.err)
+	}
+	return fmt.Sprintf("block read error on %s", e.file)
+}
+
 // CompactionGroup represents a list of files eligible to be compacted together.
 type CompactionGroup []string
 
@@ -97,7 +110,7 @@ type DefaultPlanner struct {
 	// compactFullWriteColdDuration specifies the length of time after
 	// which if no writes have been committed to the WAL, the engine will
 	// do a full compaction of the TSM files in this shard. This duration
-	// should always be greater than the CacheFlushWriteColdDuraion
+	// should always be greater than the CacheFlushWriteColdDuration
 	compactFullWriteColdDuration time.Duration
 
 	// lastPlanCheck is the last time Plan was called
@@ -242,7 +255,7 @@ func (c *DefaultPlanner) PlanLevel(level int) []CompactionGroup {
 		cur := generations[i]
 
 		// See if this generation is orphan'd which would prevent it from being further
-		// compacted until a final full compactin runs.
+		// compacted until a final full compaction runs.
 		if i < len(generations)-1 {
 			if cur.level() < generations[i+1].level() {
 				currentGen = append(currentGen, cur)
@@ -343,7 +356,7 @@ func (c *DefaultPlanner) PlanOptimize() []CompactionGroup {
 		}
 
 		// See if this generation is orphan'd which would prevent it from being further
-		// compacted until a final full compactin runs.
+		// compacted until a final full compaction runs.
 		if i < len(generations)-1 {
 			if cur.level() < generations[i+1].level() {
 				currentGen = append(currentGen, cur)
@@ -569,7 +582,7 @@ func (c *DefaultPlanner) Plan(lastWrite time.Time) []CompactionGroup {
 	// With the groups, we need to evaluate whether the group as a whole can be compacted
 	compactable := []tsmGenerations{}
 	for _, group := range groups {
-		//if we don't have enough generations to compact, skip it
+		// if we don't have enough generations to compact, skip it
 		if len(group) < 4 && !group.hasTombstones() {
 			continue
 		}
@@ -932,7 +945,7 @@ func (c *Compactor) compact(fast bool, tsmFiles []string) ([]string, error) {
 		return nil, nil
 	}
 
-	tsm, err := NewTSMKeyIterator(size, fast, intC, trs...)
+	tsm, err := NewTSMBatchKeyIterator(size, fast, intC, tsmFiles, trs...)
 	if err != nil {
 		return nil, err
 	}
@@ -1141,6 +1154,10 @@ func (c *Compactor) write(path string, iter KeyIterator, throttle bool) (err err
 			return err
 		}
 
+		if minTime > maxTime {
+			return fmt.Errorf("invalid index entry for block. min=%d, max=%d", minTime, maxTime)
+		}
+
 		// Write the key and value
 		if err := w.WriteBlock(key, minTime, maxTime, block); err == ErrMaxBlocksExceeded {
 			if err := w.WriteIndex(); err != nil {
@@ -1219,6 +1236,15 @@ type KeyIterator interface {
 	// be required to store all the series and entries in the KeyIterator.
 	EstimatedIndexSize() int
 }
+type TSMErrors []error
+
+func (t TSMErrors) Error() string {
+	e := []string{}
+	for _, v := range t {
+		e = append(e, v.Error())
+	}
+	return strings.Join(e, ", ")
+}
 
 // tsmKeyIterator implements the KeyIterator for set of TSMReaders.  Iteration produces
 // keys in sorted order and the values between the keys sorted and deduped.  If any of
@@ -1230,12 +1256,12 @@ type tsmKeyIterator struct {
 	// values is the temporary buffers for each key that is returned by a reader
 	values map[string][]Value
 
-	// pos is the current key postion within the corresponding readers slice.  A value of
+	// pos is the current key position within the corresponding readers slice.  A value of
 	// pos[0] = 1, means the reader[0] is currently at key 1 in its ordered index.
 	pos []int
 
-	// err is any error we received while iterating values.
-	err error
+	// TSMError wraps any error we received while iterating values.
+	errs TSMErrors
 
 	// indicates whether the iterator should choose a faster merging strategy over a more
 	// optimally compressed one.  If fast is true, multiple blocks will just be added as is
@@ -1269,6 +1295,10 @@ type tsmKeyIterator struct {
 	// without decode
 	merged    blocks
 	interrupt chan struct{}
+}
+
+func (t *tsmKeyIterator) AppendError(err error) {
+	t.errs = append(t.errs, err)
 }
 
 type block struct {
@@ -1393,7 +1423,7 @@ RETRY:
 			if iter.Next() {
 				key, minTime, maxTime, typ, _, b, err := iter.Read()
 				if err != nil {
-					k.err = err
+					k.AppendError(err)
 				}
 
 				// This block may have ranges of time removed from it that would
@@ -1426,7 +1456,7 @@ RETRY:
 					iter.Next()
 					key, minTime, maxTime, typ, _, b, err := iter.Read()
 					if err != nil {
-						k.err = err
+						k.AppendError(err)
 					}
 
 					tombstones := iter.r.TombstoneRange(key)
@@ -1456,7 +1486,7 @@ RETRY:
 			}
 
 			if iter.Err() != nil {
-				k.err = iter.Err()
+				k.AppendError(iter.Err())
 			}
 		}
 	}
@@ -1519,7 +1549,7 @@ func (k *tsmKeyIterator) merge() {
 	case BlockString:
 		k.mergeString()
 	default:
-		k.err = fmt.Errorf("unknown block type: %v", k.typ)
+		k.AppendError(fmt.Errorf("unknown block type: %v", k.typ))
 	}
 }
 
@@ -1532,11 +1562,11 @@ func (k *tsmKeyIterator) Read() ([]byte, int64, int64, []byte, error) {
 	}
 
 	if len(k.merged) == 0 {
-		return nil, 0, 0, nil, k.err
+		return nil, 0, 0, nil, k.Err()
 	}
 
 	block := k.merged[0]
-	return block.key, block.minTime, block.maxTime, block.b, k.err
+	return block.key, block.minTime, block.maxTime, block.b, k.Err()
 }
 
 func (k *tsmKeyIterator) Close() error {
@@ -1553,7 +1583,324 @@ func (k *tsmKeyIterator) Close() error {
 
 // Error returns any errors encountered during iteration.
 func (k *tsmKeyIterator) Err() error {
-	return k.err
+	if len(k.errs) == 0 {
+		return nil
+	}
+	return k.errs
+}
+
+// tsmBatchKeyIterator implements the KeyIterator for set of TSMReaders.  Iteration produces
+// keys in sorted order and the values between the keys sorted and deduped.  If any of
+// the readers have associated tombstone entries, they are returned as part of iteration.
+type tsmBatchKeyIterator struct {
+	// readers is the set of readers it produce a sorted key run with
+	readers []*TSMReader
+
+	// values is the temporary buffers for each key that is returned by a reader
+	values map[string][]Value
+
+	// pos is the current key position within the corresponding readers slice.  A value of
+	// pos[0] = 1, means the reader[0] is currently at key 1 in its ordered index.
+	pos []int
+
+	// errs is any error we received while iterating values.
+	errs TSMErrors
+
+	// indicates whether the iterator should choose a faster merging strategy over a more
+	// optimally compressed one.  If fast is true, multiple blocks will just be added as is
+	// and not combined.  In some cases, a slower path will need to be utilized even when
+	// fast is true to prevent overlapping blocks of time for the same key.
+	// If false, the blocks will be decoded and duplicated (if needed) and
+	// then chunked into the maximally sized blocks.
+	fast bool
+
+	// size is the maximum number of values to encode in a single block
+	size int
+
+	// key is the current key lowest key across all readers that has not be fully exhausted
+	// of values.
+	key []byte
+	typ byte
+
+	// tsmFiles are the string names of the files for use in tracking errors, ordered the same
+	// as iterators and buf
+	tsmFiles []string
+	// currentTsm is the current TSM file being iterated over
+	currentTsm string
+
+	iterators []*BlockIterator
+	blocks    blocks
+
+	buf []blocks
+
+	// mergeValues are decoded blocks that have been combined
+	mergedFloatValues    *tsdb.FloatArray
+	mergedIntegerValues  *tsdb.IntegerArray
+	mergedUnsignedValues *tsdb.UnsignedArray
+	mergedBooleanValues  *tsdb.BooleanArray
+	mergedStringValues   *tsdb.StringArray
+
+	// merged are encoded blocks that have been combined or used as is
+	// without decode
+	merged    blocks
+	interrupt chan struct{}
+}
+
+func (t *tsmBatchKeyIterator) AppendError(err error) {
+	t.errs = append(t.errs, err)
+}
+
+// NewTSMBatchKeyIterator returns a new TSM key iterator from readers.
+// size indicates the maximum number of values to encode in a single block.
+func NewTSMBatchKeyIterator(size int, fast bool, interrupt chan struct{}, tsmFiles []string, readers ...*TSMReader) (KeyIterator, error) {
+	var iter []*BlockIterator
+	for _, r := range readers {
+		iter = append(iter, r.BlockIterator())
+	}
+
+	return &tsmBatchKeyIterator{
+		readers:              readers,
+		values:               map[string][]Value{},
+		pos:                  make([]int, len(readers)),
+		size:                 size,
+		iterators:            iter,
+		fast:                 fast,
+		tsmFiles:             tsmFiles,
+		buf:                  make([]blocks, len(iter)),
+		mergedFloatValues:    &tsdb.FloatArray{},
+		mergedIntegerValues:  &tsdb.IntegerArray{},
+		mergedUnsignedValues: &tsdb.UnsignedArray{},
+		mergedBooleanValues:  &tsdb.BooleanArray{},
+		mergedStringValues:   &tsdb.StringArray{},
+		interrupt:            interrupt,
+	}, nil
+}
+
+func (k *tsmBatchKeyIterator) hasMergedValues() bool {
+	return k.mergedFloatValues.Len() > 0 ||
+		k.mergedIntegerValues.Len() > 0 ||
+		k.mergedUnsignedValues.Len() > 0 ||
+		k.mergedStringValues.Len() > 0 ||
+		k.mergedBooleanValues.Len() > 0
+}
+
+func (k *tsmBatchKeyIterator) EstimatedIndexSize() int {
+	var size uint32
+	for _, r := range k.readers {
+		size += r.IndexSize()
+	}
+	return int(size) / len(k.readers)
+}
+
+// Next returns true if there are any values remaining in the iterator.
+func (k *tsmBatchKeyIterator) Next() bool {
+RETRY:
+	// Any merged blocks pending?
+	if len(k.merged) > 0 {
+		k.merged = k.merged[1:]
+		if len(k.merged) > 0 {
+			return true
+		}
+	}
+
+	// Any merged values pending?
+	if k.hasMergedValues() {
+		k.merge()
+		if len(k.merged) > 0 || k.hasMergedValues() {
+			return true
+		}
+	}
+
+	// If we still have blocks from the last read, merge them
+	if len(k.blocks) > 0 {
+		k.merge()
+		if len(k.merged) > 0 || k.hasMergedValues() {
+			return true
+		}
+	}
+
+	// Read the next block from each TSM iterator
+	for i, v := range k.buf {
+		if len(v) != 0 {
+			continue
+		}
+
+		iter := k.iterators[i]
+		k.currentTsm = k.tsmFiles[i]
+		if iter.Next() {
+			key, minTime, maxTime, typ, _, b, err := iter.Read()
+			if err != nil {
+				k.AppendError(errBlockRead{k.currentTsm, err})
+			}
+
+			// This block may have ranges of time removed from it that would
+			// reduce the block min and max time.
+			tombstones := iter.r.TombstoneRange(key)
+
+			var blk *block
+			if cap(k.buf[i]) > len(k.buf[i]) {
+				k.buf[i] = k.buf[i][:len(k.buf[i])+1]
+				blk = k.buf[i][len(k.buf[i])-1]
+				if blk == nil {
+					blk = &block{}
+					k.buf[i][len(k.buf[i])-1] = blk
+				}
+			} else {
+				blk = &block{}
+				k.buf[i] = append(k.buf[i], blk)
+			}
+			blk.minTime = minTime
+			blk.maxTime = maxTime
+			blk.key = key
+			blk.typ = typ
+			blk.b = b
+			blk.tombstones = tombstones
+			blk.readMin = math.MaxInt64
+			blk.readMax = math.MinInt64
+
+			blockKey := key
+			for bytes.Equal(iter.PeekNext(), blockKey) {
+				iter.Next()
+				key, minTime, maxTime, typ, _, b, err := iter.Read()
+				if err != nil {
+					k.AppendError(errBlockRead{k.currentTsm, err})
+				}
+
+				tombstones := iter.r.TombstoneRange(key)
+
+				var blk *block
+				if cap(k.buf[i]) > len(k.buf[i]) {
+					k.buf[i] = k.buf[i][:len(k.buf[i])+1]
+					blk = k.buf[i][len(k.buf[i])-1]
+					if blk == nil {
+						blk = &block{}
+						k.buf[i][len(k.buf[i])-1] = blk
+					}
+				} else {
+					blk = &block{}
+					k.buf[i] = append(k.buf[i], blk)
+				}
+
+				blk.minTime = minTime
+				blk.maxTime = maxTime
+				blk.key = key
+				blk.typ = typ
+				blk.b = b
+				blk.tombstones = tombstones
+				blk.readMin = math.MaxInt64
+				blk.readMax = math.MinInt64
+			}
+		}
+
+		if iter.Err() != nil {
+			k.AppendError(errBlockRead{k.currentTsm, iter.Err()})
+		}
+	}
+
+	// Each reader could have a different key that it's currently at, need to find
+	// the next smallest one to keep the sort ordering.
+	var minKey []byte
+	var minType byte
+	for _, b := range k.buf {
+		// block could be nil if the iterator has been exhausted for that file
+		if len(b) == 0 {
+			continue
+		}
+		if len(minKey) == 0 || bytes.Compare(b[0].key, minKey) < 0 {
+			minKey = b[0].key
+			minType = b[0].typ
+		}
+	}
+	k.key = minKey
+	k.typ = minType
+
+	// Now we need to find all blocks that match the min key so we can combine and dedupe
+	// the blocks if necessary
+	for i, b := range k.buf {
+		if len(b) == 0 {
+			continue
+		}
+		if bytes.Equal(b[0].key, k.key) {
+			k.blocks = append(k.blocks, b...)
+			k.buf[i] = k.buf[i][:0]
+		}
+	}
+
+	if len(k.blocks) == 0 {
+		return false
+	}
+
+	k.merge()
+
+	// After merging all the values for this key, we might not have any.  (e.g. they were all deleted
+	// through many tombstones).  In this case, move on to the next key instead of ending iteration.
+	if len(k.merged) == 0 {
+		goto RETRY
+	}
+
+	return len(k.merged) > 0
+}
+
+// merge combines the next set of blocks into merged blocks.
+func (k *tsmBatchKeyIterator) merge() {
+	switch k.typ {
+	case BlockFloat64:
+		k.mergeFloat()
+	case BlockInteger:
+		k.mergeInteger()
+	case BlockUnsigned:
+		k.mergeUnsigned()
+	case BlockBoolean:
+		k.mergeBoolean()
+	case BlockString:
+		k.mergeString()
+	default:
+		k.AppendError(errBlockRead{k.currentTsm, fmt.Errorf("unknown block type: %v", k.typ)})
+	}
+}
+
+func (k *tsmBatchKeyIterator) handleEncodeError(err error, typ string) {
+	k.AppendError(errBlockRead{k.currentTsm, fmt.Errorf("encode error: unable to compress block type %s for key '%s': %v", typ, k.key, err)})
+}
+
+func (k *tsmBatchKeyIterator) handleDecodeError(err error, typ string) {
+	k.AppendError(errBlockRead{k.currentTsm, fmt.Errorf("decode error: unable to decompress block type %s for key '%s': %v", typ, k.key, err)})
+}
+
+func (k *tsmBatchKeyIterator) Read() ([]byte, int64, int64, []byte, error) {
+	// See if compactions were disabled while we were running.
+	select {
+	case <-k.interrupt:
+		return nil, 0, 0, nil, errCompactionAborted{}
+	default:
+	}
+
+	if len(k.merged) == 0 {
+		return nil, 0, 0, nil, k.Err()
+	}
+
+	block := k.merged[0]
+	return block.key, block.minTime, block.maxTime, block.b, k.Err()
+}
+
+func (k *tsmBatchKeyIterator) Close() error {
+	k.values = nil
+	k.pos = nil
+	k.iterators = nil
+	for _, r := range k.readers {
+		if err := r.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Error returns any errors encountered during iteration.
+func (k *tsmBatchKeyIterator) Err() error {
+	if len(k.errs) == 0 {
+		return nil
+	}
+	return k.errs
 }
 
 type cacheKeyIterator struct {

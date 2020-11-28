@@ -8,10 +8,10 @@ import (
 	"sort"
 	"unsafe"
 
-	"github.com/influxdata/influxdb/pkg/estimator"
-	"github.com/influxdata/influxdb/pkg/estimator/hll"
-	"github.com/influxdata/influxdb/pkg/rhh"
-	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/v2/pkg/estimator"
+	"github.com/influxdata/influxdb/v2/pkg/estimator/hll"
+	"github.com/influxdata/influxdb/v2/pkg/rhh"
+	"github.com/influxdata/influxdb/v2/tsdb"
 )
 
 // MeasurementBlockVersion is the version of the measurement block.
@@ -350,7 +350,7 @@ type MeasurementBlockElem struct {
 
 	seriesIDSet *tsdb.SeriesIDSet
 
-	// size in bytes, set after unmarshaling.
+	// size in bytes, set after unmarshalling.
 	size int
 }
 

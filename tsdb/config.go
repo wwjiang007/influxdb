@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/influxdata/influxdb/monitor/diagnostics"
-	"github.com/influxdata/influxdb/toml"
+	"github.com/influxdata/influxdb/v2/toml"
+	"github.com/influxdata/influxdb/v2/v1/monitor/diagnostics"
 )
 
 const (
@@ -14,7 +14,7 @@ const (
 	DefaultEngine = "tsm1"
 
 	// DefaultIndex is the default index for new shards
-	DefaultIndex = InmemIndexName
+	DefaultIndex = TSI1IndexName
 
 	// tsdb/engine/wal configuration options
 
@@ -66,6 +66,14 @@ const (
 	// DefaultMaxIndexLogFileSize is the default threshold, in bytes, when an index
 	// write-ahead log file will compact into an index file.
 	DefaultMaxIndexLogFileSize = 1 * 1024 * 1024 // 1MB
+
+	// DefaultSeriesIDSetCacheSize is the default number of series ID sets to cache in the TSI index.
+	DefaultSeriesIDSetCacheSize = 100
+
+	// DefaultSeriesFileMaxConcurrentSnapshotCompactions is the maximum number of concurrent series
+	// partition snapshot compactions that can run at one time.
+	// A value of 0 results in runtime.GOMAXPROCS(0).
+	DefaultSeriesFileMaxConcurrentSnapshotCompactions = 0
 )
 
 // Config holds the configuration for the tsbd package.
@@ -104,7 +112,7 @@ type Config struct {
 	MaxSeriesPerDatabase int `toml:"max-series-per-database"`
 
 	// MaxValuesPerTag is the maximum number of tag values a single tag key can have within
-	// a measurement.  When the limit is execeeded, writes return an error.
+	// a measurement.  When the limit is exceeded, writes return an error.
 	// A value of 0 disables the limit.
 	MaxValuesPerTag int `toml:"max-values-per-tag"`
 
@@ -119,6 +127,18 @@ type Config struct {
 	// and result in lower heap usage at the expense of write throughput. Higher sizes will
 	// be compacted less frequently, store more series in-memory, and provide higher write throughput.
 	MaxIndexLogFileSize toml.Size `toml:"max-index-log-file-size"`
+
+	// SeriesIDSetCacheSize is the number items that can be cached within the TSI index. TSI caching can help
+	// with query performance when the same tag key/value predicates are commonly used on queries.
+	// Setting series-id-set-cache-size to 0 disables the cache.
+	SeriesIDSetCacheSize int `toml:"series-id-set-cache-size"`
+
+	// SeriesFileMaxConcurrentSnapshotCompactions is the maximum number of concurrent snapshot compactions
+	// that can be running at one time across all series partitions in a database. Snapshots scheduled
+	// to run when the limit is reached are blocked until a running snapshot completes.  Only snapshot
+	// compactions are affected by this limit. A value of 0 limits snapshot compactions to the lesser of
+	// 8 (series file partition quantity) and runtime.GOMAXPROCS(0).
+	SeriesFileMaxConcurrentSnapshotCompactions int `toml:"series-file-max-concurrent-snapshot-compactions"`
 
 	TraceLoggingEnabled bool `toml:"trace-logging-enabled"`
 
@@ -148,7 +168,10 @@ func NewConfig() Config {
 		MaxValuesPerTag:          DefaultMaxValuesPerTag,
 		MaxConcurrentCompactions: DefaultMaxConcurrentCompactions,
 
-		MaxIndexLogFileSize: toml.Size(DefaultMaxIndexLogFileSize),
+		MaxIndexLogFileSize:  toml.Size(DefaultMaxIndexLogFileSize),
+		SeriesIDSetCacheSize: DefaultSeriesIDSetCacheSize,
+
+		SeriesFileMaxConcurrentSnapshotCompactions: DefaultSeriesFileMaxConcurrentSnapshotCompactions,
 
 		TraceLoggingEnabled: false,
 		TSMWillNeed:         false,
@@ -164,7 +187,15 @@ func (c *Config) Validate() error {
 	}
 
 	if c.MaxConcurrentCompactions < 0 {
-		return errors.New("max-concurrent-compactions must be greater than 0")
+		return errors.New("max-concurrent-compactions must be non-negative")
+	}
+
+	if c.SeriesIDSetCacheSize < 0 {
+		return errors.New("series-id-set-cache-size must be non-negative")
+	}
+
+	if c.SeriesFileMaxConcurrentSnapshotCompactions < 0 {
+		return errors.New("series-file-max-concurrent-compactions must be non-negative")
 	}
 
 	valid := false
@@ -195,15 +226,18 @@ func (c *Config) Validate() error {
 // Diagnostics returns a diagnostics representation of a subset of the Config.
 func (c Config) Diagnostics() (*diagnostics.Diagnostics, error) {
 	return diagnostics.RowFromMap(map[string]interface{}{
-		"dir":                                c.Dir,
-		"wal-dir":                            c.WALDir,
-		"wal-fsync-delay":                    c.WALFsyncDelay,
-		"cache-max-memory-size":              c.CacheMaxMemorySize,
-		"cache-snapshot-memory-size":         c.CacheSnapshotMemorySize,
-		"cache-snapshot-write-cold-duration": c.CacheSnapshotWriteColdDuration,
-		"compact-full-write-cold-duration":   c.CompactFullWriteColdDuration,
-		"max-series-per-database":            c.MaxSeriesPerDatabase,
-		"max-values-per-tag":                 c.MaxValuesPerTag,
-		"max-concurrent-compactions":         c.MaxConcurrentCompactions,
+		"dir":                                    c.Dir,
+		"wal-dir":                                c.WALDir,
+		"wal-fsync-delay":                        c.WALFsyncDelay,
+		"cache-max-memory-size":                  c.CacheMaxMemorySize,
+		"cache-snapshot-memory-size":             c.CacheSnapshotMemorySize,
+		"cache-snapshot-write-cold-duration":     c.CacheSnapshotWriteColdDuration,
+		"compact-full-write-cold-duration":       c.CompactFullWriteColdDuration,
+		"max-series-per-database":                c.MaxSeriesPerDatabase,
+		"max-values-per-tag":                     c.MaxValuesPerTag,
+		"max-concurrent-compactions":             c.MaxConcurrentCompactions,
+		"max-index-log-file-size":                c.MaxIndexLogFileSize,
+		"series-id-set-cache-size":               c.SeriesIDSetCacheSize,
+		"series-file-max-concurrent-compactions": c.SeriesFileMaxConcurrentSnapshotCompactions,
 	}), nil
 }

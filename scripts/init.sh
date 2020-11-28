@@ -38,9 +38,6 @@ if [ ! -x $DAEMON ]; then
     exit 5
 fi
 
-# Configuration file
-CONFIG=/etc/influxdb/influxdb.conf
-
 # PID file for the daemon
 PIDFILE=/var/run/influxdb/influxd.pid
 PIDDIR=`dirname $PIDFILE`
@@ -58,7 +55,7 @@ fi
 
 # Logging
 if [ -z "$STDOUT" ]; then
-    STDOUT=/dev/null
+    STDOUT=/var/log/influxdb/influxd.log
 fi
 
 if [ ! -f "$STDOUT" ]; then
@@ -87,12 +84,6 @@ function log_success_msg() {
 }
 
 function start() {
-    # Check if config file exist
-    if [ ! -r $CONFIG ]; then
-        log_failure_msg "config file $CONFIG doesn't exist (or you don't have permission to view)"
-        exit 4
-    fi
-
     # Check that the PID file exists, and check the actual status of process
     if [ -f $PIDFILE ]; then
         PID="$(cat $PIDFILE)"
@@ -127,16 +118,15 @@ function start() {
             --pidfile $PIDFILE \
             --exec $DAEMON \
             -- \
-            -pidfile $PIDFILE \
-            -config $CONFIG \
             $INFLUXD_OPTS >>$STDOUT 2>>$STDERR &
     else
-        local CMD="$DAEMON -pidfile $PIDFILE -config $CONFIG $INFLUXD_OPTS >>$STDOUT 2>>$STDERR &"
+        local CMD="$DAEMON $INFLUXD_OPTS >>$STDOUT 2>>$STDERR &"
         su -s /bin/sh -c "$CMD" $USER
     fi
 
     # Sleep to verify process is still up
     sleep 1
+    echo $(pgrep -u $USER -f influxd) > $PIDFILE
     if [ -f $PIDFILE ]; then
         # PIDFILE exists
         if kill -0 $(cat $PIDFILE) &>/dev/null; then

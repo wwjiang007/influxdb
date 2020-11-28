@@ -8,11 +8,11 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/pkg/bytesutil"
-	"github.com/influxdata/influxdb/pkg/radix"
-	"github.com/influxdata/influxdb/query"
-	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/v2/influxql/query"
+	"github.com/influxdata/influxdb/v2/models"
+	"github.com/influxdata/influxdb/v2/pkg/bytesutil"
+	"github.com/influxdata/influxdb/v2/pkg/radix"
+	"github.com/influxdata/influxdb/v2/tsdb"
 	"github.com/influxdata/influxql"
 )
 
@@ -32,7 +32,7 @@ type measurement struct {
 	seriesByID          map[uint64]*series      // lookup table for series by their id
 	seriesByTagKeyValue map[string]*tagKeyValue // map from tag key to value to sorted set of series ids
 
-	// lazyily created sorted series IDs
+	// lazily created sorted series IDs
 	sortedSeriesIDs seriesIDs // sorted list of series IDs in this measurement
 
 	// Indicates whether the seriesByTagKeyValueMap needs to be rebuilt as it contains deleted series
@@ -1128,8 +1128,14 @@ func (t *tagKeyValue) Load(value string) seriesIDs {
 
 	t.mu.RLock()
 	entry := t.entries[value]
-	ids := entry.ids()
+	ids, changed := entry.ids()
 	t.mu.RUnlock()
+
+	if changed {
+		t.mu.Lock()
+		entry.setIDs(ids)
+		t.mu.Unlock()
+	}
 	return ids
 }
 
@@ -1142,13 +1148,22 @@ func (t *tagKeyValue) Range(f func(tagValue string, a seriesIDs) bool) {
 	}
 
 	t.mu.RLock()
-	defer t.mu.RUnlock()
 	for tagValue, entry := range t.entries {
-		ids := entry.ids()
+		ids, changed := entry.ids()
+		if changed {
+			t.mu.RUnlock()
+			t.mu.Lock()
+			entry.setIDs(ids)
+			t.mu.Unlock()
+			t.mu.RLock()
+		}
+
 		if !f(tagValue, ids) {
+			t.mu.RUnlock()
 			return
 		}
 	}
+	t.mu.RUnlock()
 }
 
 // RangeAll calls f sequentially on each key and value. A call to RangeAll on a
@@ -1169,13 +1184,11 @@ func newTagKeyValueEntry() *tagKeyValueEntry {
 	return &tagKeyValueEntry{m: make(map[uint64]struct{})}
 }
 
-func (e *tagKeyValueEntry) ids() seriesIDs {
+func (e *tagKeyValueEntry) ids() (_ seriesIDs, changed bool) {
 	if e == nil {
-		return nil
-	}
-
-	if len(e.a) == len(e.m) {
-		return e.a
+		return nil, false
+	} else if len(e.a) == len(e.m) {
+		return e.a, false
 	}
 
 	a := make(seriesIDs, 0, len(e.m))
@@ -1184,9 +1197,14 @@ func (e *tagKeyValueEntry) ids() seriesIDs {
 	}
 	radix.SortUint64s(a)
 
-	e.a = a
-	return e.a
+	return a, true
+}
 
+func (e *tagKeyValueEntry) setIDs(a seriesIDs) {
+	if e == nil {
+		return
+	}
+	e.a = a
 }
 
 // SeriesIDs is a convenience type for sorting, checking equality, and doing

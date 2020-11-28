@@ -6,8 +6,8 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/influxdata/influxdb/pkg/pool"
-	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/v2/pkg/pool"
+	"github.com/influxdata/influxdb/v2/tsdb"
 	"github.com/influxdata/influxql"
 )
 
@@ -169,12 +169,12 @@ func (e EmptyValue) Size() int { return 0 }
 // String returns the empty string.
 func (e EmptyValue) String() string { return "" }
 
-func (_ EmptyValue) internalOnly()    {}
-func (_ StringValue) internalOnly()   {}
-func (_ IntegerValue) internalOnly()  {}
-func (_ UnsignedValue) internalOnly() {}
-func (_ BooleanValue) internalOnly()  {}
-func (_ FloatValue) internalOnly()    {}
+func (EmptyValue) internalOnly()    {}
+func (StringValue) internalOnly()   {}
+func (IntegerValue) internalOnly()  {}
+func (UnsignedValue) internalOnly() {}
+func (BooleanValue) internalOnly()  {}
+func (FloatValue) internalOnly()    {}
 
 // Encode converts the values to a byte slice.  If there are no values,
 // this function panics.
@@ -234,28 +234,28 @@ func BlockType(block []byte) (byte, error) {
 }
 
 // BlockCount returns the number of timestamps encoded in block.
-func BlockCount(block []byte) int {
+func BlockCount(block []byte) (int, error) {
 	if len(block) <= encodedBlockHeaderSize {
-		panic(fmt.Sprintf("count of short block: got %v, exp %v", len(block), encodedBlockHeaderSize))
+		return 0, fmt.Errorf("count of short block: got %v, exp %v", len(block), encodedBlockHeaderSize)
 	}
 	// first byte is the block type
 	tb, _, err := unpackBlock(block[1:])
 	if err != nil {
-		panic(fmt.Sprintf("BlockCount: error unpacking block: %s", err.Error()))
+		return 0, fmt.Errorf("BlockCount: error unpacking block: %v", err)
 	}
-	return CountTimestamps(tb)
+	return CountTimestamps(tb), nil
 }
 
 // DecodeBlock takes a byte slice and decodes it into values of the appropriate type
 // based on the block.
 func DecodeBlock(block []byte, vals []Value) ([]Value, error) {
 	if len(block) <= encodedBlockHeaderSize {
-		panic(fmt.Sprintf("decode of short block: got %v, exp %v", len(block), encodedBlockHeaderSize))
+		return nil, fmt.Errorf("decode of short block: got %v, exp %v", len(block), encodedBlockHeaderSize)
 	}
 
 	blockType, err := BlockType(block)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error decoding block type: %v", err)
 	}
 
 	switch blockType {
@@ -314,7 +314,7 @@ func DecodeBlock(block []byte, vals []Value) ([]Value, error) {
 		return vals[:len(decoded)], err
 
 	default:
-		panic(fmt.Sprintf("unknown block type: %d", blockType))
+		return nil, fmt.Errorf("unknown block type: %d", blockType)
 	}
 }
 
@@ -343,6 +343,8 @@ func (v FloatValue) Size() int {
 func (v FloatValue) String() string {
 	return fmt.Sprintf("%v %v", time.Unix(0, v.unixnano), v.value)
 }
+
+func (v FloatValue) RawValue() float64 { return v.value }
 
 func encodeFloatBlock(buf []byte, values []Value) ([]byte, error) {
 	if len(values) == 0 {
@@ -479,6 +481,8 @@ func (v BooleanValue) String() string {
 	return fmt.Sprintf("%v %v", time.Unix(0, v.unixnano), v.Value())
 }
 
+func (v BooleanValue) RawValue() bool { return v.value }
+
 func encodeBooleanBlock(buf []byte, values []Value) ([]byte, error) {
 	if len(values) == 0 {
 		return nil, nil
@@ -606,6 +610,8 @@ func (v IntegerValue) String() string {
 	return fmt.Sprintf("%v %v", time.Unix(0, v.unixnano), v.Value())
 }
 
+func (v IntegerValue) RawValue() int64 { return v.value }
+
 func encodeIntegerBlock(buf []byte, values []Value) ([]byte, error) {
 	tenc := getTimeEncoder(len(values))
 	venc := getIntegerEncoder(len(values))
@@ -725,6 +731,8 @@ func (v UnsignedValue) String() string {
 	return fmt.Sprintf("%v %v", time.Unix(0, v.unixnano), v.Value())
 }
 
+func (v UnsignedValue) RawValue() uint64 { return v.value }
+
 func encodeUnsignedBlock(buf []byte, values []Value) ([]byte, error) {
 	tenc := getTimeEncoder(len(values))
 	venc := getUnsignedEncoder(len(values))
@@ -843,6 +851,8 @@ func (v StringValue) Size() int {
 func (v StringValue) String() string {
 	return fmt.Sprintf("%v %v", time.Unix(0, v.unixnano), v.Value())
 }
+
+func (v StringValue) RawValue() string { return v.value }
 
 func encodeStringBlock(buf []byte, values []Value) ([]byte, error) {
 	tenc := getTimeEncoder(len(values))

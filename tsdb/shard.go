@@ -19,14 +19,14 @@ import (
 	"unsafe"
 
 	"github.com/gogo/protobuf/proto"
-	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/pkg/bytesutil"
-	"github.com/influxdata/influxdb/pkg/estimator"
-	"github.com/influxdata/influxdb/pkg/file"
-	"github.com/influxdata/influxdb/pkg/limiter"
-	"github.com/influxdata/influxdb/pkg/slices"
-	"github.com/influxdata/influxdb/query"
-	internal "github.com/influxdata/influxdb/tsdb/internal"
+	"github.com/influxdata/influxdb/v2/influxql/query"
+	"github.com/influxdata/influxdb/v2/models"
+	"github.com/influxdata/influxdb/v2/pkg/bytesutil"
+	"github.com/influxdata/influxdb/v2/pkg/estimator"
+	"github.com/influxdata/influxdb/v2/pkg/file"
+	"github.com/influxdata/influxdb/v2/pkg/limiter"
+	"github.com/influxdata/influxdb/v2/pkg/slices"
+	internal "github.com/influxdata/influxdb/v2/tsdb/internal"
 	"github.com/influxdata/influxql"
 	"go.uber.org/zap"
 )
@@ -73,7 +73,7 @@ var (
 	// ErrUnknownFieldType is returned when the type of a field cannot be determined.
 	ErrUnknownFieldType = errors.New("unknown field type")
 
-	// ErrShardNotIdle is returned when an operation requring the shard to be idle/cold is
+	// ErrShardNotIdle is returned when an operation requiring the shard to be idle/cold is
 	// attempted on a hot shard.
 	ErrShardNotIdle = errors.New("shard not idle")
 
@@ -264,6 +264,13 @@ func (s *Shard) Statistics(tags map[string]string) []models.Statistic {
 	seriesN := engine.SeriesN()
 
 	tags = s.defaultTags.Merge(tags)
+
+	// Set the index type on the tags.  N.B this needs to be checked since it's
+	// only set when the shard is opened.
+	if indexType := s.IndexType(); indexType != "" {
+		tags["indexType"] = indexType
+	}
+
 	statistics := []models.Statistic{{
 		Name: "shard",
 		Tags: tags,
@@ -424,7 +431,9 @@ func (s *Shard) Index() (Index, error) {
 	return s.index, nil
 }
 
-func (s *Shard) seriesFile() (*SeriesFile, error) {
+// SeriesFile returns a reference the underlying series file. If return an error
+// if the series file is nil.
+func (s *Shard) SeriesFile() (*SeriesFile, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if err := s.ready(); err != nil {
@@ -467,7 +476,7 @@ func (s *Shard) SetCompactionsEnabled(enabled bool) {
 func (s *Shard) DiskSize() (int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	// We don't use engine() becuase we still want to report the shard's disk
+	// We don't use engine() because we still want to report the shard's disk
 	// size even if the shard has been disabled.
 	if s._engine == nil {
 		return 0, ErrEngineClosed
@@ -595,8 +604,6 @@ func (s *Shard) validateSeriesAndFields(points []models.Point) ([]models.Point, 
 		}
 	}
 
-	// Create a MeasurementFields cache.
-	mfCache := make(map[string]*MeasurementFields, 16)
 	j = 0
 	for i, p := range points {
 		// Skip any points with only invalid fields.
@@ -624,13 +631,8 @@ func (s *Shard) validateSeriesAndFields(points []models.Point) ([]models.Point, 
 			continue
 		}
 
-		// Grab the MeasurementFields checking the local cache to avoid lock contention.
 		name := p.Name()
-		mf := mfCache[string(name)]
-		if mf == nil {
-			mf = engine.MeasurementFields(name).Clone()
-			mfCache[string(name)] = mf
-		}
+		mf := engine.MeasurementFields(name)
 
 		// Check with the field validator.
 		if err := s.options.FieldValidator.Validate(mf, p); err != nil {
@@ -797,9 +799,17 @@ func (s *Shard) MeasurementTagKeyValuesByExpr(auth query.Authorizer, name []byte
 	return indexSet.MeasurementTagKeyValuesByExpr(auth, name, key, expr, keysSorted)
 }
 
+// MeasurementNamesByPredicate returns fields for a measurement filtered by an expression.
+func (s *Shard) MeasurementNamesByPredicate(expr influxql.Expr) ([][]byte, error) {
+	index, err := s.Index()
+	if err != nil {
+		return nil, err
+	}
+	indexSet := IndexSet{Indexes: []Index{index}, SeriesFile: s.sfile}
+	return indexSet.MeasurementNamesByPredicate(query.OpenAuthorizer, expr)
+}
+
 // MeasurementFields returns fields for a measurement.
-// TODO(edd): This method is currently only being called from tests; do we
-// really need it?
 func (s *Shard) MeasurementFields(name []byte) *MeasurementFields {
 	engine, err := s.Engine()
 	if err != nil {
@@ -1254,6 +1264,38 @@ func (a Shards) FieldKeysByMeasurement(name []byte) []string {
 	return slices.MergeSortedStrings(all...)
 }
 
+// MeasurementNamesByPredicate returns the measurements that match the given predicate.
+func (a Shards) MeasurementNamesByPredicate(expr influxql.Expr) ([][]byte, error) {
+	if len(a) == 1 {
+		return a[0].MeasurementNamesByPredicate(expr)
+	}
+
+	all := make([][][]byte, len(a))
+	for i, shard := range a {
+		names, err := shard.MeasurementNamesByPredicate(expr)
+		if err != nil {
+			return nil, err
+		}
+		all[i] = names
+	}
+	return slices.MergeSortedBytes(all...), nil
+}
+
+// FieldKeysByPredicate returns the field keys for series that match
+// the given predicate.
+func (a Shards) FieldKeysByPredicate(expr influxql.Expr) (map[string][]string, error) {
+	names, err := a.MeasurementNamesByPredicate(expr)
+	if err != nil {
+		return nil, err
+	}
+
+	all := make(map[string][]string, len(names))
+	for _, name := range names {
+		all[string(name)] = a.FieldKeysByMeasurement(name)
+	}
+	return all, nil
+}
+
 func (a Shards) FieldDimensions(measurements []string) (fields map[string]influxql.DataType, dimensions map[string]struct{}, err error) {
 	fields = make(map[string]influxql.DataType)
 	dimensions = make(map[string]struct{})
@@ -1339,7 +1381,7 @@ func (a Shards) createSeriesIterator(ctx context.Context, opt query.IteratorOpti
 			idxs = append(idxs, idx)
 		}
 		if sfile == nil {
-			sfile, _ = sh.seriesFile()
+			sfile, _ = sh.SeriesFile()
 		}
 	}
 
@@ -1412,7 +1454,7 @@ func (a Shards) CreateSeriesCursor(ctx context.Context, req SeriesCursorRequest,
 			idxs = append(idxs, idx)
 		}
 		if sfile == nil {
-			sfile, _ = sh.seriesFile()
+			sfile, _ = sh.SeriesFile()
 		}
 	}
 
@@ -1463,22 +1505,23 @@ func (a Shards) ExpandSources(sources influxql.Sources) (influxql.Sources, error
 
 // MeasurementFields holds the fields of a measurement and their codec.
 type MeasurementFields struct {
-	mu sync.RWMutex
+	mu sync.Mutex
 
-	fields map[string]*Field
+	fields atomic.Value // map[string]*Field
 }
 
 // NewMeasurementFields returns an initialised *MeasurementFields value.
 func NewMeasurementFields() *MeasurementFields {
-	return &MeasurementFields{fields: make(map[string]*Field)}
+	fields := make(map[string]*Field)
+	mf := &MeasurementFields{}
+	mf.fields.Store(fields)
+	return mf
 }
 
 func (m *MeasurementFields) FieldKeys() []string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	a := make([]string, 0, len(m.fields))
-	for key := range m.fields {
+	fields := m.fields.Load().(map[string]*Field)
+	a := make([]string, 0, len(fields))
+	for key := range fields {
 		a = append(a, key)
 	}
 	sort.Strings(a)
@@ -1488,14 +1531,13 @@ func (m *MeasurementFields) FieldKeys() []string {
 // bytes estimates the memory footprint of this MeasurementFields, in bytes.
 func (m *MeasurementFields) bytes() int {
 	var b int
-	m.mu.RLock()
 	b += 24 // mu RWMutex is 24 bytes
-	b += int(unsafe.Sizeof(m.fields))
-	for k, v := range m.fields {
+	fields := m.fields.Load().(map[string]*Field)
+	b += int(unsafe.Sizeof(fields))
+	for k, v := range fields {
 		b += int(unsafe.Sizeof(k)) + len(k)
 		b += int(unsafe.Sizeof(v)+unsafe.Sizeof(*v)) + len(v.Name)
 	}
-	m.mu.RUnlock()
 	return b
 }
 
@@ -1503,53 +1545,52 @@ func (m *MeasurementFields) bytes() int {
 // Returns an error if 255 fields have already been created on the measurement or
 // the fields already exists with a different type.
 func (m *MeasurementFields) CreateFieldIfNotExists(name []byte, typ influxql.DataType) error {
-	m.mu.RLock()
+	fields := m.fields.Load().(map[string]*Field)
 
 	// Ignore if the field already exists.
-	if f := m.fields[string(name)]; f != nil {
+	if f := fields[string(name)]; f != nil {
 		if f.Type != typ {
-			m.mu.RUnlock()
 			return ErrFieldTypeConflict
 		}
-		m.mu.RUnlock()
 		return nil
 	}
-	m.mu.RUnlock()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	fields = m.fields.Load().(map[string]*Field)
 	// Re-check field and type under write lock.
-	if f := m.fields[string(name)]; f != nil {
+	if f := fields[string(name)]; f != nil {
 		if f.Type != typ {
 			return ErrFieldTypeConflict
 		}
 		return nil
 	}
 
+	fieldsUpdate := make(map[string]*Field, len(fields)+1)
+	for k, v := range fields {
+		fieldsUpdate[k] = v
+	}
 	// Create and append a new field.
 	f := &Field{
-		ID:   uint8(len(m.fields) + 1),
+		ID:   uint8(len(fields) + 1),
 		Name: string(name),
 		Type: typ,
 	}
-	m.fields[string(name)] = f
+	fieldsUpdate[string(name)] = f
+	m.fields.Store(fieldsUpdate)
 
 	return nil
 }
 
 func (m *MeasurementFields) FieldN() int {
-	m.mu.RLock()
-	n := len(m.fields)
-	m.mu.RUnlock()
+	n := len(m.fields.Load().(map[string]*Field))
 	return n
 }
 
 // Field returns the field for name, or nil if there is no field for name.
 func (m *MeasurementFields) Field(name string) *Field {
-	m.mu.RLock()
-	f := m.fields[name]
-	m.mu.RUnlock()
+	f := m.fields.Load().(map[string]*Field)[name]
 	return f
 }
 
@@ -1557,9 +1598,7 @@ func (m *MeasurementFields) HasField(name string) bool {
 	if m == nil {
 		return false
 	}
-	m.mu.RLock()
-	f := m.fields[name]
-	m.mu.RUnlock()
+	f := m.fields.Load().(map[string]*Field)[name]
 	return f != nil
 }
 
@@ -1568,44 +1607,26 @@ func (m *MeasurementFields) HasField(name string) bool {
 // it avoids a string allocation, which can't be avoided if the caller converts
 // the []byte to a string and calls Field.
 func (m *MeasurementFields) FieldBytes(name []byte) *Field {
-	m.mu.RLock()
-	f := m.fields[string(name)]
-	m.mu.RUnlock()
+	f := m.fields.Load().(map[string]*Field)[string(name)]
 	return f
 }
 
 // FieldSet returns the set of fields and their types for the measurement.
 func (m *MeasurementFields) FieldSet() map[string]influxql.DataType {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	fields := make(map[string]influxql.DataType)
-	for name, f := range m.fields {
-		fields[name] = f.Type
+	fields := m.fields.Load().(map[string]*Field)
+	fieldTypes := make(map[string]influxql.DataType)
+	for name, f := range fields {
+		fieldTypes[name] = f.Type
 	}
-	return fields
+	return fieldTypes
 }
 
 func (m *MeasurementFields) ForEachField(fn func(name string, typ influxql.DataType) bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for name, f := range m.fields {
+	fields := m.fields.Load().(map[string]*Field)
+	for name, f := range fields {
 		if !fn(name, f.Type) {
 			return
 		}
-	}
-}
-
-// Clone returns copy of the MeasurementFields
-func (m *MeasurementFields) Clone() *MeasurementFields {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	fields := make(map[string]*Field, len(m.fields))
-	for key, field := range m.fields {
-		fields[key] = field
-	}
-	return &MeasurementFields{
-		fields: fields,
 	}
 }
 
@@ -1654,7 +1675,7 @@ func (fs *MeasurementFieldSet) Fields(name []byte) *MeasurementFields {
 	return mf
 }
 
-// FieldsByString returns fields for a measurment by name.
+// FieldsByString returns fields for a measurement by name.
 func (fs *MeasurementFieldSet) FieldsByString(name string) *MeasurementFields {
 	fs.mu.RLock()
 	mf := fs.fields[name]
@@ -1738,12 +1759,12 @@ func (fs *MeasurementFieldSet) saveNoLock() error {
 	}
 	for name, mf := range fs.fields {
 		fs := &internal.MeasurementFields{
-			Name:   name,
+			Name:   []byte(name),
 			Fields: make([]*internal.Field, 0, mf.FieldN()),
 		}
 
 		mf.ForEachField(func(field string, typ influxql.DataType) bool {
-			fs.Fields = append(fs.Fields, &internal.Field{Name: field, Type: int32(typ)})
+			fs.Fields = append(fs.Fields, &internal.Field{Name: []byte(field), Type: int32(typ)})
 			return true
 		})
 
@@ -1808,18 +1829,18 @@ func (fs *MeasurementFieldSet) load() error {
 
 	fs.fields = make(map[string]*MeasurementFields, len(pb.GetMeasurements()))
 	for _, measurement := range pb.GetMeasurements() {
-		set := &MeasurementFields{
-			fields: make(map[string]*Field, len(measurement.GetFields())),
-		}
+		fields := make(map[string]*Field, len(measurement.GetFields()))
 		for _, field := range measurement.GetFields() {
-			set.fields[field.GetName()] = &Field{Name: field.GetName(), Type: influxql.DataType(field.GetType())}
+			fields[string(field.GetName())] = &Field{Name: string(field.GetName()), Type: influxql.DataType(field.GetType())}
 		}
-		fs.fields[measurement.GetName()] = set
+		set := &MeasurementFields{}
+		set.fields.Store(fields)
+		fs.fields[string(measurement.GetName())] = set
 	}
 	return nil
 }
 
-// Field represents a series field.
+// Field represents a series field. All of the fields must be hashable.
 type Field struct {
 	ID   uint8             `json:"id,omitempty"`
 	Name string            `json:"name,omitempty"`

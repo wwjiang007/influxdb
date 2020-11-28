@@ -3,7 +3,7 @@ package internal
 import (
 	"time"
 
-	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/v2/v1/services/meta"
 	"github.com/influxdata/influxql"
 )
 

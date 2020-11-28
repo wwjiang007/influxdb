@@ -17,18 +17,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/influxdata/influxdb/internal"
+	"github.com/influxdata/influxdb/v2/internal"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/pkg/deep"
-	"github.com/influxdata/influxdb/query"
-	"github.com/influxdata/influxdb/tsdb"
-	_ "github.com/influxdata/influxdb/tsdb/engine"
-	_ "github.com/influxdata/influxdb/tsdb/index"
-	"github.com/influxdata/influxdb/tsdb/index/inmem"
+	"github.com/influxdata/influxdb/v2/influxql/query"
+	"github.com/influxdata/influxdb/v2/models"
+	"github.com/influxdata/influxdb/v2/pkg/deep"
+	"github.com/influxdata/influxdb/v2/tsdb"
+	_ "github.com/influxdata/influxdb/v2/tsdb/engine"
+	_ "github.com/influxdata/influxdb/v2/tsdb/index"
+	"github.com/influxdata/influxdb/v2/tsdb/index/inmem"
 	"github.com/influxdata/influxql"
 )
 
@@ -166,6 +166,7 @@ func TestMaxSeriesLimit(t *testing.T) {
 	opts.Config.WALDir = filepath.Join(tmpDir, "wal")
 	opts.Config.MaxSeriesPerDatabase = 1000
 	opts.InmemIndex = inmem.NewIndex(filepath.Base(tmpDir), sfile.SeriesFile)
+	opts.IndexVersion = tsdb.InmemIndexName
 
 	sh := tsdb.NewShard(1, tmpShard, tmpWal, sfile.SeriesFile, opts)
 
@@ -222,6 +223,7 @@ func TestShard_MaxTagValuesLimit(t *testing.T) {
 	opts.Config.WALDir = filepath.Join(tmpDir, "wal")
 	opts.Config.MaxValuesPerTag = 1000
 	opts.InmemIndex = inmem.NewIndex(filepath.Base(tmpDir), sfile.SeriesFile)
+	opts.IndexVersion = tsdb.InmemIndexName
 
 	sh := tsdb.NewShard(1, tmpShard, tmpWal, sfile.SeriesFile, opts)
 
@@ -491,6 +493,7 @@ func TestShard_WritePoints_FieldConflictConcurrent(t *testing.T) {
 }
 
 func TestShard_WritePoints_FieldConflictConcurrentQuery(t *testing.T) {
+	t.Skip("https://github.com/influxdata/influxdb/v2/issues/14267")
 	if testing.Short() {
 		t.Skip()
 	}
@@ -1747,12 +1750,18 @@ func BenchmarkWritePoints_NewSeries_5000_Measurement_1_TagKey_1_TagValue(b *test
 func BenchmarkWritePoints_NewSeries_10000_Measurement_1_TagKey_1_TagValue(b *testing.B) {
 	benchmarkWritePoints(b, 10000, 1, 1, 1)
 }
+
+func BenchmarkWritePoints_NewSeries_1000_Measurement_10_TagKey_1_TagValue(b *testing.B) {
+	benchmarkWritePoints(b, 1000, 10, 1, 1)
+}
+
 func BenchmarkWritePoints_NewSeries_50000_Measurement_1_TagKey_1_TagValue(b *testing.B) {
 	benchmarkWritePoints(b, 50000, 1, 1, 1)
 }
 func BenchmarkWritePoints_NewSeries_100000_Measurement_1_TagKey_1_TagValue(b *testing.B) {
 	benchmarkWritePoints(b, 100000, 1, 1, 1)
 }
+
 func BenchmarkWritePoints_NewSeries_500000_Measurement_1_TagKey_1_TagValue(b *testing.B) {
 	benchmarkWritePoints(b, 500000, 1, 1, 1)
 }
@@ -1815,6 +1824,7 @@ func BenchmarkWritePoints_ExistingSeries_1K(b *testing.B) {
 func BenchmarkWritePoints_ExistingSeries_100K(b *testing.B) {
 	benchmarkWritePointsExistingSeries(b, 32, 5, 5, 1)
 }
+
 func BenchmarkWritePoints_ExistingSeries_250K(b *testing.B) {
 	benchmarkWritePointsExistingSeries(b, 80, 5, 5, 1)
 }
@@ -1823,6 +1833,23 @@ func BenchmarkWritePoints_ExistingSeries_500K(b *testing.B) {
 }
 func BenchmarkWritePoints_ExistingSeries_1M(b *testing.B) {
 	benchmarkWritePointsExistingSeries(b, 320, 5, 5, 1)
+}
+
+// The following two benchmarks measure time to write 10k points at a time for comparing performance with different measurement cardinalities.
+func BenchmarkWritePoints_ExistingSeries_100K_1_1(b *testing.B) {
+	benchmarkWritePointsExistingSeriesEqualBatches(b, 100000, 1, 1, 1)
+}
+
+func BenchmarkWritePoints_ExistingSeries_10K_10_1(b *testing.B) {
+	benchmarkWritePointsExistingSeriesEqualBatches(b, 10000, 10, 1, 1)
+}
+
+func BenchmarkWritePoints_ExistingSeries_100K_1_1_Fields(b *testing.B) {
+	benchmarkWritePointsExistingSeriesFields(b, 100000, 1, 1, 1)
+}
+
+func BenchmarkWritePoints_ExistingSeries_10K_10_1_Fields(b *testing.B) {
+	benchmarkWritePointsExistingSeriesFields(b, 10000, 10, 1, 1)
 }
 
 // benchmarkWritePoints benchmarks writing new series to a shard.
@@ -1851,14 +1878,11 @@ func benchmarkWritePoints(b *testing.B, mCnt, tkCnt, tvCnt, pntCnt int) {
 
 	// Run the benchmark loop.
 	for n := 0; n < b.N; n++ {
-		tmpDir, _ := ioutil.TempDir("", "shard_test")
-		tmpShard := filepath.Join(tmpDir, "shard")
-		tmpWal := filepath.Join(tmpDir, "wal")
-		opts := tsdb.NewEngineOptions()
-		opts.Config.WALDir = tmpWal
-		opts.InmemIndex = inmem.NewIndex(filepath.Base(tmpDir), sfile.SeriesFile)
-		shard := tsdb.NewShard(1, tmpShard, tmpWal, sfile.SeriesFile, opts)
-		shard.Open()
+		shard, tmpDir, err := openShard(sfile)
+		if err != nil {
+			shard.Close()
+			b.Fatal(err)
+		}
 
 		b.StartTimer()
 		// Call the function being benchmarked.
@@ -1890,16 +1914,14 @@ func benchmarkWritePointsExistingSeries(b *testing.B, mCnt, tkCnt, tvCnt, pntCnt
 	sfile := MustOpenSeriesFile()
 	defer sfile.Close()
 
-	tmpDir, _ := ioutil.TempDir("", "")
-	defer os.RemoveAll(tmpDir)
-	tmpShard := filepath.Join(tmpDir, "shard")
-	tmpWal := filepath.Join(tmpDir, "wal")
-	opts := tsdb.NewEngineOptions()
-	opts.Config.WALDir = tmpWal
-	opts.InmemIndex = inmem.NewIndex(filepath.Base(tmpDir), sfile.SeriesFile)
-	shard := tsdb.NewShard(1, tmpShard, tmpWal, sfile.SeriesFile, opts)
-	shard.Open()
-	defer shard.Close()
+	shard, tmpDir, err := openShard(sfile)
+	defer func() {
+		_ = shard.Close()
+	}()
+	if err != nil {
+		b.Fatal(err)
+	}
+
 	chunkedWrite(shard, points)
 
 	// Reset timers and mem-stats before the main benchmark loop.
@@ -1908,6 +1930,7 @@ func benchmarkWritePointsExistingSeries(b *testing.B, mCnt, tkCnt, tvCnt, pntCnt
 	// Run the benchmark loop.
 	for n := 0; n < b.N; n++ {
 		b.StopTimer()
+
 		for _, p := range points {
 			p.SetTime(p.Time().Add(time.Second))
 		}
@@ -1916,6 +1939,125 @@ func benchmarkWritePointsExistingSeries(b *testing.B, mCnt, tkCnt, tvCnt, pntCnt
 		// Call the function being benchmarked.
 		chunkedWrite(shard, points)
 	}
+	os.RemoveAll(tmpDir)
+}
+
+func benchmarkWritePointsExistingSeriesFields(b *testing.B, mCnt, tkCnt, tvCnt, pntCnt int) {
+	// Generate test series (measurements + unique tag sets).
+	series := genTestSeries(mCnt, tkCnt, tvCnt)
+	// Generate point data to write to the shard.
+	points := []models.Point{}
+	for _, s := range series {
+		i := 0
+		for val := 0.0; val < float64(pntCnt); val++ {
+			field := fmt.Sprintf("v%d", i%256)
+			p := models.MustNewPoint(s.Measurement, s.Tags, map[string]interface{}{field: val}, time.Now())
+			points = append(points, p)
+			i++
+		}
+	}
+
+	sfile := MustOpenSeriesFile()
+	defer func() {
+		_ = sfile.Close()
+	}()
+
+	shard, tmpDir, err := openShard(sfile)
+	defer func() {
+		_ = shard.Close()
+	}()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	chunkedWrite(shard, points)
+
+	// Reset timers and mem-stats before the main benchmark loop.
+	b.ResetTimer()
+
+	// Run the benchmark loop.
+	for n := 0; n < b.N; n++ {
+		b.StopTimer()
+
+		for _, p := range points {
+			p.SetTime(p.Time().Add(time.Second))
+		}
+
+		b.StartTimer()
+		// Call the function being benchmarked.
+		chunkedWrite(shard, points)
+	}
+	os.RemoveAll(tmpDir)
+}
+
+func benchmarkWritePointsExistingSeriesEqualBatches(b *testing.B, mCnt, tkCnt, tvCnt, pntCnt int) {
+	// Generate test series (measurements + unique tag sets).
+	series := genTestSeries(mCnt, tkCnt, tvCnt)
+	// Generate point data to write to the shard.
+	points := []models.Point{}
+	for _, s := range series {
+		for val := 0.0; val < float64(pntCnt); val++ {
+			p := models.MustNewPoint(s.Measurement, s.Tags, map[string]interface{}{"value": val}, time.Now())
+			points = append(points, p)
+		}
+	}
+
+	sfile := MustOpenSeriesFile()
+	defer sfile.Close()
+
+	shard, tmpDir, err := openShard(sfile)
+	defer func() {
+		_ = shard.Close()
+	}()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	chunkedWrite(shard, points)
+
+	// Reset timers and mem-stats before the main benchmark loop.
+	b.ResetTimer()
+
+	// Run the benchmark loop.
+	nPts := len(points)
+	chunkSz := 10000
+	start := 0
+	end := chunkSz
+	for n := 0; n < b.N; n++ {
+		b.StopTimer()
+
+		if end > nPts {
+			end = nPts
+		}
+		if end-start == 0 {
+			start = 0
+			end = chunkSz
+		}
+
+		for _, p := range points[start:end] {
+			p.SetTime(p.Time().Add(time.Second))
+		}
+
+		b.StartTimer()
+		shard.WritePoints(points[start:end])
+		b.StopTimer()
+
+		start = end
+		end += chunkSz
+	}
+	os.RemoveAll(tmpDir)
+}
+
+func openShard(sfile *SeriesFile) (*tsdb.Shard, string, error) {
+	tmpDir, _ := ioutil.TempDir("", "shard_test")
+	tmpShard := filepath.Join(tmpDir, "shard")
+	tmpWal := filepath.Join(tmpDir, "wal")
+	opts := tsdb.NewEngineOptions()
+	opts.Config.WALDir = tmpWal
+	opts.InmemIndex = inmem.NewIndex(filepath.Base(tmpDir), sfile.SeriesFile)
+	shard := tsdb.NewShard(1, tmpShard, tmpWal, sfile.SeriesFile, opts)
+	err := shard.Open()
+	return shard, tmpDir, err
 }
 
 func BenchmarkCreateIterator(b *testing.B) {

@@ -1,8 +1,10 @@
+//lint:file-ignore SA2002 this is older code, and `go test` will panic if its really a problem.
 package tsdb_test
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"math"
@@ -13,25 +15,25 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/influxdata/influxdb/tsdb/index/inmem"
-
 	"github.com/davecgh/go-spew/spew"
-	"github.com/influxdata/influxdb/internal"
-	"github.com/influxdata/influxdb/logger"
-	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/pkg/deep"
-	"github.com/influxdata/influxdb/query"
-	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/v2/influxql/query"
+	"github.com/influxdata/influxdb/v2/internal"
+	"github.com/influxdata/influxdb/v2/logger"
+	"github.com/influxdata/influxdb/v2/models"
+	"github.com/influxdata/influxdb/v2/pkg/deep"
+	"github.com/influxdata/influxdb/v2/pkg/slices"
+	"github.com/influxdata/influxdb/v2/tsdb"
+	"github.com/influxdata/influxdb/v2/tsdb/index/inmem"
 	"github.com/influxdata/influxql"
 )
 
 // Ensure the store can delete a retention policy and all shards under
 // it.
 func TestStore_DeleteRetentionPolicy(t *testing.T) {
-	t.Parallel()
 
 	test := func(index string) {
 		s := MustOpenStore(index)
@@ -107,7 +109,6 @@ func TestStore_DeleteRetentionPolicy(t *testing.T) {
 
 // Ensure the store can create a new shard.
 func TestStore_CreateShard(t *testing.T) {
-	t.Parallel()
 
 	test := func(index string) {
 		s := MustOpenStore(index)
@@ -142,9 +143,240 @@ func TestStore_CreateShard(t *testing.T) {
 	}
 }
 
+func TestStore_CreateMixedShards(t *testing.T) {
+
+	test := func(index1 string, index2 string) {
+		s := MustOpenStore(index1)
+		defer s.Close()
+
+		// Create a new shard and verify that it exists.
+		if err := s.CreateShard("db0", "rp0", 1, true); err != nil {
+			t.Fatal(err)
+		} else if sh := s.Shard(1); sh == nil {
+			t.Fatalf("expected shard")
+		}
+
+		s.EngineOptions.IndexVersion = index2
+		s.index = index2
+		if err := s.Reopen(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create another shard and verify that it exists.
+		if err := s.CreateShard("db0", "rp0", 2, true); err != nil {
+			t.Fatal(err)
+		} else if sh := s.Shard(2); sh == nil {
+			t.Fatalf("expected shard")
+		}
+
+		// Reopen shard and recheck.
+		if err := s.Reopen(); err != nil {
+			t.Fatal(err)
+		} else if sh := s.Shard(1); sh == nil {
+			t.Fatalf("expected shard(1)")
+		} else if sh = s.Shard(2); sh == nil {
+			t.Fatalf("expected shard(2)")
+		}
+
+		sh := s.Shard(1)
+		if sh.IndexType() != index1 {
+			t.Fatalf("got index %v, expected %v", sh.IndexType(), index1)
+		}
+
+		sh = s.Shard(2)
+		if sh.IndexType() != index2 {
+			t.Fatalf("got index %v, expected %v", sh.IndexType(), index2)
+		}
+	}
+
+	indexes := tsdb.RegisteredIndexes()
+	for i := range indexes {
+		j := (i + 1) % len(indexes)
+		index1 := indexes[i]
+		index2 := indexes[j]
+		t.Run(fmt.Sprintf("%s-%s", index1, index2), func(t *testing.T) { test(index1, index2) })
+	}
+}
+
+func TestStore_DropMeasurementMixedShards(t *testing.T) {
+
+	test := func(index1 string, index2 string) {
+		s := MustOpenStore(index1)
+		defer s.Close()
+
+		if err := s.CreateShard("db0", "rp0", 1, true); err != nil {
+			t.Fatal(err)
+		}
+
+		s.MustWriteToShardString(1, "mem,server=a v=1 10")
+
+		s.EngineOptions.IndexVersion = index2
+		s.index = index2
+		if err := s.Reopen(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := s.CreateShard("db0", "rp0", 2, true); err != nil {
+			t.Fatal(err)
+		}
+
+		s.MustWriteToShardString(2, "mem,server=b v=1 20")
+
+		s.MustWriteToShardString(1, "cpu,server=a v=1 10")
+		s.MustWriteToShardString(2, "cpu,server=b v=1 20")
+
+		err := s.DeleteMeasurement("db0", "cpu")
+		if err != tsdb.ErrMultipleIndexTypes {
+			t.Fatal(err)
+		} else if err == nil {
+			t.Fatal("expect failure deleting measurement on multiple index types")
+		}
+	}
+
+	indexes := tsdb.RegisteredIndexes()
+	for i := range indexes {
+		j := (i + 1) % len(indexes)
+		index1 := indexes[i]
+		index2 := indexes[j]
+		t.Run(fmt.Sprintf("%s-%s", index1, index2), func(t *testing.T) { test(index1, index2) })
+	}
+}
+
+func TestStore_DropConcurrentWriteMultipleShards(t *testing.T) {
+
+	test := func(index string) {
+		s := MustOpenStore(index)
+		defer s.Close()
+
+		if err := s.CreateShard("db0", "rp0", 1, true); err != nil {
+			t.Fatal(err)
+		}
+
+		s.MustWriteToShardString(1, "mem,server=a v=1 10")
+
+		if err := s.CreateShard("db0", "rp0", 2, true); err != nil {
+			t.Fatal(err)
+		}
+
+		s.MustWriteToShardString(2, "mem,server=b v=1 20")
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				s.MustWriteToShardString(1, "cpu,server=a v=1 10")
+				s.MustWriteToShardString(2, "cpu,server=b v=1 20")
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				err := s.DeleteMeasurement("db0", "cpu")
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+		}()
+
+		wg.Wait()
+
+		err := s.DeleteMeasurement("db0", "cpu")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		measurements, err := s.MeasurementNames(query.OpenAuthorizer, "db0", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		exp := [][]byte{[]byte("mem")}
+		if got, exp := measurements, exp; !reflect.DeepEqual(got, exp) {
+			t.Fatal(fmt.Errorf("got measurements %v, expected %v", got, exp))
+		}
+	}
+
+	for _, index := range tsdb.RegisteredIndexes() {
+		t.Run(index, func(t *testing.T) { test(index) })
+	}
+}
+
+func TestStore_WriteMixedShards(t *testing.T) {
+
+	test := func(index1 string, index2 string) {
+		s := MustOpenStore(index1)
+		defer s.Close()
+
+		if err := s.CreateShard("db0", "rp0", 1, true); err != nil {
+			t.Fatal(err)
+		}
+
+		s.MustWriteToShardString(1, "mem,server=a v=1 10")
+
+		s.EngineOptions.IndexVersion = index2
+		s.index = index2
+		if err := s.Reopen(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := s.CreateShard("db0", "rp0", 2, true); err != nil {
+			t.Fatal(err)
+		}
+
+		s.MustWriteToShardString(2, "mem,server=b v=1 20")
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				s.MustWriteToShardString(1, fmt.Sprintf("cpu,server=a,f%0.2d=a v=1", i*2))
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				s.MustWriteToShardString(2, fmt.Sprintf("cpu,server=b,f%0.2d=b v=1 20", i*2+1))
+			}
+		}()
+
+		wg.Wait()
+
+		keys, err := s.TagKeys(nil, []uint64{1, 2}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		cpuKeys := make([]string, 101)
+		for i := 0; i < 100; i++ {
+			cpuKeys[i] = fmt.Sprintf("f%0.2d", i)
+		}
+		cpuKeys[100] = "server"
+		expKeys := []tsdb.TagKeys{
+			{Measurement: "cpu", Keys: cpuKeys},
+			{Measurement: "mem", Keys: []string{"server"}},
+		}
+		if got, exp := keys, expKeys; !reflect.DeepEqual(got, exp) {
+			t.Fatalf("got keys %v, expected %v", got, exp)
+		}
+	}
+
+	indexes := tsdb.RegisteredIndexes()
+	for i := range indexes {
+		j := (i + 1) % len(indexes)
+		index1 := indexes[i]
+		index2 := indexes[j]
+		t.Run(fmt.Sprintf("%s-%s", index1, index2), func(t *testing.T) { test(index1, index2) })
+	}
+}
+
 // Ensure the store does not return an error when delete from a non-existent db.
 func TestStore_DeleteSeries_NonExistentDB(t *testing.T) {
-	t.Parallel()
 
 	test := func(index string) {
 		s := MustOpenStore(index)
@@ -162,7 +394,6 @@ func TestStore_DeleteSeries_NonExistentDB(t *testing.T) {
 
 // Ensure the store can delete an existing shard.
 func TestStore_DeleteShard(t *testing.T) {
-	t.Parallel()
 
 	test := func(index string) error {
 		s := MustOpenStore(index)
@@ -251,7 +482,6 @@ func TestStore_DeleteShard(t *testing.T) {
 
 // Ensure the store can create a snapshot to a shard.
 func TestStore_CreateShardSnapShot(t *testing.T) {
-	t.Parallel()
 
 	test := func(index string) {
 		s := MustOpenStore(index)
@@ -279,7 +509,6 @@ func TestStore_CreateShardSnapShot(t *testing.T) {
 }
 
 func TestStore_Open(t *testing.T) {
-	t.Parallel()
 
 	test := func(index string) {
 		s := NewStore(index)
@@ -322,7 +551,6 @@ func TestStore_Open(t *testing.T) {
 
 // Ensure the store reports an error when it can't open a database directory.
 func TestStore_Open_InvalidDatabaseFile(t *testing.T) {
-	t.Parallel()
 
 	test := func(index string) {
 		s := NewStore(index)
@@ -348,7 +576,6 @@ func TestStore_Open_InvalidDatabaseFile(t *testing.T) {
 
 // Ensure the store reports an error when it can't open a retention policy.
 func TestStore_Open_InvalidRetentionPolicy(t *testing.T) {
-	t.Parallel()
 
 	test := func(index string) {
 		s := NewStore(index)
@@ -378,7 +605,6 @@ func TestStore_Open_InvalidRetentionPolicy(t *testing.T) {
 
 // Ensure the store reports an error when it can't open a retention policy.
 func TestStore_Open_InvalidShard(t *testing.T) {
-	t.Parallel()
 
 	test := func(index string) {
 		s := NewStore(index)
@@ -408,7 +634,6 @@ func TestStore_Open_InvalidShard(t *testing.T) {
 
 // Ensure shards can create iterators.
 func TestShards_CreateIterator(t *testing.T) {
-	t.Parallel()
 
 	test := func(index string) {
 		s := MustOpenStore(index)
@@ -571,7 +796,6 @@ func TestStore_BackupRestoreShard(t *testing.T) {
 	}
 }
 func TestStore_Shard_SeriesN(t *testing.T) {
-	t.Parallel()
 
 	test := func(index string) error {
 		s := MustOpenStore(index)
@@ -607,7 +831,6 @@ func TestStore_Shard_SeriesN(t *testing.T) {
 }
 
 func TestStore_MeasurementNames_Deduplicate(t *testing.T) {
-	t.Parallel()
 
 	test := func(index string) {
 		s := MustOpenStore(index)
@@ -704,10 +927,9 @@ func testStoreCardinalityTombstoning(t *testing.T, store *Store) {
 }
 
 func TestStore_Cardinality_Tombstoning(t *testing.T) {
-	t.Parallel()
 
-	if testing.Short() || os.Getenv("GORACE") != "" || os.Getenv("APPVEYOR") != "" {
-		t.Skip("Skipping test in short, race and appveyor mode.")
+	if testing.Short() || os.Getenv("GORACE") != "" || os.Getenv("APPVEYOR") != "" || os.Getenv("CIRCLECI") != "" {
+		t.Skip("Skipping test in short, race, circleci and appveyor mode.")
 	}
 
 	test := func(index string) {
@@ -769,10 +991,9 @@ func testStoreCardinalityUnique(t *testing.T, store *Store) {
 }
 
 func TestStore_Cardinality_Unique(t *testing.T) {
-	t.Parallel()
 
-	if testing.Short() || os.Getenv("GORACE") != "" || os.Getenv("APPVEYOR") != "" {
-		t.Skip("Skipping test in short, race and appveyor mode.")
+	if testing.Short() || os.Getenv("GORACE") != "" || os.Getenv("APPVEYOR") != "" || os.Getenv("CIRCLECI") != "" {
+		t.Skip("Skipping test in short, race, circleci and appveyor mode.")
 	}
 
 	test := func(index string) {
@@ -816,7 +1037,7 @@ func testStoreCardinalityDuplicates(t *testing.T, store *Store) {
 			// For other shards we write a random sub-section of all the points.
 			// which will duplicate the series and shouldn't increase the
 			// cardinality.
-			from, to := rand.Intn(len(points)), rand.Intn(len(points))
+			from, to = rand.Intn(len(points)), rand.Intn(len(points))
 			if from > to {
 				from, to = to, from
 			}
@@ -851,10 +1072,9 @@ func testStoreCardinalityDuplicates(t *testing.T, store *Store) {
 }
 
 func TestStore_Cardinality_Duplicates(t *testing.T) {
-	t.Parallel()
 
-	if testing.Short() || os.Getenv("GORACE") != "" || os.Getenv("APPVEYOR") != "" {
-		t.Skip("Skipping test in short, race and appveyor mode.")
+	if testing.Short() || os.Getenv("GORACE") != "" || os.Getenv("APPVEYOR") != "" || os.Getenv("CIRCLECI") != "" {
+		t.Skip("Skipping test in short, race, circleci and appveyor mode.")
 	}
 
 	test := func(index string) {
@@ -921,8 +1141,8 @@ func testStoreCardinalityCompactions(store *Store) error {
 }
 
 func TestStore_Cardinality_Compactions(t *testing.T) {
-	if testing.Short() || os.Getenv("GORACE") != "" || os.Getenv("APPVEYOR") != "" {
-		t.Skip("Skipping test in short, race and appveyor mode.")
+	if testing.Short() || os.Getenv("GORACE") != "" || os.Getenv("APPVEYOR") != "" || os.Getenv("CIRCLECI") != "" {
+		t.Skip("Skipping test in short, race, circleci and appveyor mode.")
 	}
 
 	test := func(index string) error {
@@ -944,8 +1164,66 @@ func TestStore_Cardinality_Compactions(t *testing.T) {
 	}
 }
 
+func TestStore_Cardinality_Limit_On_InMem_Index(t *testing.T) {
+
+	if testing.Short() || os.Getenv("GORACE") != "" || os.Getenv("APPVEYOR") != "" || os.Getenv("CIRCLECI") != "" {
+		t.Skip("Skipping test in short, race, circleci and appveyor mode.")
+	}
+
+	store := NewStore("inmem")
+	store.EngineOptions.Config.MaxSeriesPerDatabase = 100000
+	if err := store.Open(); err != nil {
+		panic(err)
+	}
+	defer store.Close()
+
+	// Generate 200,000 series to write.
+	series := genTestSeries(64, 5, 5)
+
+	// Add 1 point to each series.
+	points := make([]models.Point, 0, len(series))
+	for _, s := range series {
+		points = append(points, models.MustNewPoint(s.Measurement, s.Tags, map[string]interface{}{"value": 1.0}, time.Now()))
+	}
+
+	// Create shards to write points into.
+	numShards := 10
+	for shardID := 0; shardID < numShards; shardID++ {
+		if err := store.CreateShard("db", "rp", uint64(shardID), true); err != nil {
+			t.Fatalf("create shard: %s", err)
+		}
+	}
+
+	// Write series / points to the shards.
+	pointsPerShard := len(points) / numShards
+
+	for shardID := 0; shardID < numShards; shardID++ {
+		from := shardID * pointsPerShard
+		to := from + pointsPerShard
+
+		if err := store.Store.WriteToShard(uint64(shardID), points[from:to]); err != nil {
+			if !strings.Contains(err.Error(), "partial write: max-series-per-database limit exceeded:") {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Get updated series cardinality from store after writing data.
+	cardinality, err := store.Store.SeriesCardinality("db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expCardinality := store.EngineOptions.Config.MaxSeriesPerDatabase
+
+	// Estimated cardinality should be well within 1.5% of the actual cardinality.
+	got := math.Abs(float64(cardinality)-float64(expCardinality)) / float64(expCardinality)
+	exp := 0.015
+	if got > exp {
+		t.Errorf("got epsilon of %v for series cardinality %d (expected %d), which is larger than expected %v", got, cardinality, expCardinality, exp)
+	}
+}
+
 func TestStore_Sketches(t *testing.T) {
-	t.Parallel()
 
 	checkCardinalities := func(store *tsdb.Store, series, tseries, measurements, tmeasurements int) error {
 		// Get sketches and check cardinality...
@@ -1041,7 +1319,7 @@ func TestStore_Sketches(t *testing.T) {
 		}
 
 		// Check cardinalities. In this case, the indexes behave differently.
-		expS, expTS, expM, expTM := 160, 0, 10, 5
+		expS, expTS, expM, expTM := 160, 80, 10, 5
 		if index == inmem.IndexName {
 			expS, expTS, expM, expTM = 160, 80, 10, 5
 		}
@@ -1057,7 +1335,7 @@ func TestStore_Sketches(t *testing.T) {
 		}
 
 		// Check cardinalities. In this case, the indexes behave differently.
-		expS, expTS, expM, expTM = 160, 0, 5, 5
+		expS, expTS, expM, expTM = 80, 80, 5, 5
 		if index == inmem.IndexName {
 			expS, expTS, expM, expTM = 80, 0, 5, 0
 		}
@@ -1078,7 +1356,6 @@ func TestStore_Sketches(t *testing.T) {
 }
 
 func TestStore_TagValues(t *testing.T) {
-	t.Parallel()
 
 	// No WHERE - just get for keys host and shard
 	RHSAll := &influxql.ParenExpr{
@@ -1212,7 +1489,6 @@ func TestStore_TagValues(t *testing.T) {
 }
 
 func TestStore_Measurements_Auth(t *testing.T) {
-	t.Parallel()
 
 	test := func(index string) error {
 		s := MustOpenStore(index)
@@ -1301,7 +1577,6 @@ func TestStore_Measurements_Auth(t *testing.T) {
 }
 
 func TestStore_TagKeys_Auth(t *testing.T) {
-	t.Parallel()
 
 	test := func(index string) error {
 		s := MustOpenStore(index)
@@ -1399,7 +1674,6 @@ func TestStore_TagKeys_Auth(t *testing.T) {
 }
 
 func TestStore_TagValues_Auth(t *testing.T) {
-	t.Parallel()
 
 	test := func(index string) error {
 		s := MustOpenStore(index)
@@ -1529,6 +1803,286 @@ func createTagValues(mname string, kvs map[string][]string) tsdb.TagValues {
 	}
 
 	return out
+}
+
+func TestStore_MeasurementNames_ConcurrentDropShard(t *testing.T) {
+	for _, index := range tsdb.RegisteredIndexes() {
+		s := MustOpenStore(index)
+		defer s.Close()
+
+		shardN := 10
+		for i := 0; i < shardN; i++ {
+			// Create new shards with some data
+			s.MustCreateShardWithData("db0", "rp0", i,
+				`cpu,host=serverA value=1 30`,
+				`mem,region=west value=2 40`, // skip: wrong source
+				`cpu,host=serverC value=3 60`,
+			)
+		}
+
+		done := make(chan struct{})
+		errC := make(chan error, 2)
+
+		// Randomly close and open the shards.
+		go func() {
+			for {
+				select {
+				case <-done:
+					errC <- nil
+					return
+				default:
+					i := uint64(rand.Intn(int(shardN)))
+					if sh := s.Shard(i); sh == nil {
+						errC <- errors.New("shard should not be nil")
+						return
+					} else {
+						if err := sh.Close(); err != nil {
+							errC <- err
+							return
+						}
+						time.Sleep(500 * time.Microsecond)
+						if err := sh.Open(); err != nil {
+							errC <- err
+							return
+						}
+					}
+				}
+			}
+		}()
+
+		// Attempt to get tag keys from the shards.
+		go func() {
+			for {
+				select {
+				case <-done:
+					errC <- nil
+					return
+				default:
+					names, err := s.MeasurementNames(nil, "db0", nil)
+					if err == tsdb.ErrIndexClosing || err == tsdb.ErrEngineClosed {
+						continue // These errors are expected
+					}
+
+					if err != nil {
+						errC <- err
+						return
+					}
+
+					if got, exp := names, slices.StringsToBytes("cpu", "mem"); !reflect.DeepEqual(got, exp) {
+						errC <- fmt.Errorf("got keys %v, expected %v", got, exp)
+						return
+					}
+				}
+			}
+		}()
+
+		// Run for 500ms
+		time.Sleep(500 * time.Millisecond)
+		close(done)
+
+		// Check for errors.
+		if err := <-errC; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-errC; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestStore_TagKeys_ConcurrentDropShard(t *testing.T) {
+	for _, index := range tsdb.RegisteredIndexes() {
+		s := MustOpenStore(index)
+		defer s.Close()
+
+		shardN := 10
+		for i := 0; i < shardN; i++ {
+			// Create new shards with some data
+			s.MustCreateShardWithData("db0", "rp0", i,
+				`cpu,host=serverA value=1 30`,
+				`mem,region=west value=2 40`, // skip: wrong source
+				`cpu,host=serverC value=3 60`,
+			)
+		}
+
+		done := make(chan struct{})
+		errC := make(chan error, 2)
+
+		// Randomly close and open the shards.
+		go func() {
+			for {
+				select {
+				case <-done:
+					errC <- nil
+					return
+				default:
+					i := uint64(rand.Intn(int(shardN)))
+					if sh := s.Shard(i); sh == nil {
+						errC <- errors.New("shard should not be nil")
+						return
+					} else {
+						if err := sh.Close(); err != nil {
+							errC <- err
+							return
+						}
+						time.Sleep(500 * time.Microsecond)
+						if err := sh.Open(); err != nil {
+							errC <- err
+							return
+						}
+					}
+				}
+			}
+		}()
+
+		// Attempt to get tag keys from the shards.
+		go func() {
+			for {
+				select {
+				case <-done:
+					errC <- nil
+					return
+				default:
+					keys, err := s.TagKeys(nil, []uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, nil)
+					if err == tsdb.ErrIndexClosing || err == tsdb.ErrEngineClosed {
+						continue // These errors are expected
+					}
+
+					if err != nil {
+						errC <- err
+						return
+					}
+
+					if got, exp := keys[0].Keys, []string{"host"}; !reflect.DeepEqual(got, exp) {
+						errC <- fmt.Errorf("got keys %v, expected %v", got, exp)
+						return
+					}
+
+					if got, exp := keys[1].Keys, []string{"region"}; !reflect.DeepEqual(got, exp) {
+						errC <- fmt.Errorf("got keys %v, expected %v", got, exp)
+						return
+					}
+				}
+			}
+		}()
+
+		// Run for 500ms
+		time.Sleep(500 * time.Millisecond)
+
+		close(done)
+
+		// Check for errors
+		if err := <-errC; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-errC; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestStore_TagValues_ConcurrentDropShard(t *testing.T) {
+	for _, index := range tsdb.RegisteredIndexes() {
+		s := MustOpenStore(index)
+		defer s.Close()
+
+		shardN := 10
+		for i := 0; i < shardN; i++ {
+			// Create new shards with some data
+			s.MustCreateShardWithData("db0", "rp0", i,
+				`cpu,host=serverA value=1 30`,
+				`mem,region=west value=2 40`, // skip: wrong source
+				`cpu,host=serverC value=3 60`,
+			)
+		}
+
+		done := make(chan struct{})
+		errC := make(chan error, 2)
+
+		// Randomly close and open the shards.
+		go func() {
+			for {
+				select {
+				case <-done:
+					errC <- nil
+					return
+				default:
+					i := uint64(rand.Intn(int(shardN)))
+					if sh := s.Shard(i); sh == nil {
+						errC <- errors.New("shard should not be nil")
+						return
+					} else {
+						if err := sh.Close(); err != nil {
+							errC <- err
+							return
+						}
+						time.Sleep(500 * time.Microsecond)
+						if err := sh.Open(); err != nil {
+							errC <- err
+							return
+						}
+					}
+				}
+			}
+		}()
+
+		// Attempt to get tag keys from the shards.
+		go func() {
+			for {
+				select {
+				case <-done:
+					errC <- nil
+					return
+				default:
+					stmt, err := influxql.ParseStatement(`SHOW TAG VALUES WITH KEY = "host"`)
+					if err != nil {
+						t.Fatal(err)
+					}
+					rewrite, err := query.RewriteStatement(stmt)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					cond := rewrite.(*influxql.ShowTagValuesStatement).Condition
+					values, err := s.TagValues(nil, []uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, cond)
+					if err == tsdb.ErrIndexClosing || err == tsdb.ErrEngineClosed {
+						continue // These errors are expected
+					}
+
+					if err != nil {
+						errC <- err
+						return
+					}
+
+					exp := tsdb.TagValues{
+						Measurement: "cpu",
+						Values: []tsdb.KeyValue{
+							tsdb.KeyValue{Key: "host", Value: "serverA"},
+							tsdb.KeyValue{Key: "host", Value: "serverC"},
+						},
+					}
+
+					if got := values[0]; !reflect.DeepEqual(got, exp) {
+						errC <- fmt.Errorf("got keys %v, expected %v", got, exp)
+						return
+					}
+				}
+			}
+		}()
+
+		// Run for 500ms
+		time.Sleep(500 * time.Millisecond)
+
+		close(done)
+
+		// Check for errors
+		if err := <-errC; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-errC; err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func BenchmarkStore_SeriesCardinality_100_Shards(b *testing.B) {

@@ -2,7 +2,7 @@ package tracing
 
 import (
 	"github.com/gogo/protobuf/proto"
-	"github.com/influxdata/influxdb/pkg/tracing/wire"
+	"github.com/influxdata/influxdb/v2/pkg/tracing/wire"
 )
 
 // A SpanContext represents the minimal information to identify a span in a trace.

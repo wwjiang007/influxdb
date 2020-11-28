@@ -9,7 +9,7 @@ package tsm1
 import (
 	"sort"
 
-	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/v2/tsdb"
 )
 
 // Array Cursors
@@ -54,6 +54,10 @@ func (c *floatArrayAscendingCursor) reset(seek, end int64, cacheValues Values, t
 }
 
 func (c *floatArrayAscendingCursor) Err() error { return nil }
+
+func (c *floatArrayAscendingCursor) Stats() tsdb.CursorStats {
+	return tsdb.CursorStats{}
+}
 
 // close closes the cursor and any dependent cursors.
 func (c *floatArrayAscendingCursor) Close() {
@@ -101,8 +105,10 @@ func (c *floatArrayAscendingCursor) Next() *tsdb.FloatArray {
 
 	if pos < len(c.res.Timestamps) {
 		if c.tsm.pos < len(tvals.Timestamps) {
-			if pos == 0 {
-				// optimization: all points served from TSM data
+			if pos == 0 && len(c.res.Timestamps) >= len(tvals.Timestamps) {
+				// optimization: all points can be served from TSM data because
+				// we need the entire block and the block completely fits within
+				// the buffer.
 				copy(c.res.Timestamps, tvals.Timestamps)
 				pos += copy(c.res.Values, tvals.Values)
 				c.nextTSM()
@@ -129,9 +135,9 @@ func (c *floatArrayAscendingCursor) Next() *tsdb.FloatArray {
 		}
 	}
 
-	if pos > 0 && c.res.Timestamps[pos-1] > c.end {
+	if pos > 0 && c.res.Timestamps[pos-1] >= c.end {
 		pos -= 2
-		for pos >= 0 && c.res.Timestamps[pos] > c.end {
+		for pos >= 0 && c.res.Timestamps[pos] >= c.end {
 			pos--
 		}
 		pos++
@@ -178,36 +184,24 @@ func newFloatArrayDescendingCursor() *floatArrayDescendingCursor {
 func (c *floatArrayDescendingCursor) reset(seek, end int64, cacheValues Values, tsmKeyCursor *KeyCursor) {
 	c.end = end
 	c.cache.values = cacheValues
-	if len(c.cache.values) > 0 {
-		c.cache.pos = sort.Search(len(c.cache.values), func(i int) bool {
-			return c.cache.values[i].UnixNano() >= seek
-		})
-		if c.cache.pos == len(c.cache.values) {
-			c.cache.pos--
-		} else if c.cache.values[c.cache.pos].UnixNano() != seek {
-			c.cache.pos--
-		}
-	} else {
-		c.cache.pos = -1
-	}
+	c.cache.pos = sort.Search(len(c.cache.values), func(i int) bool {
+		return c.cache.values[i].UnixNano() >= seek
+	})
+	c.cache.pos--
 
 	c.tsm.keyCursor = tsmKeyCursor
 	c.tsm.values, _ = c.tsm.keyCursor.ReadFloatArrayBlock(c.tsm.buf)
 	c.tsm.pos = sort.Search(c.tsm.values.Len(), func(i int) bool {
 		return c.tsm.values.Timestamps[i] >= seek
 	})
-	if c.tsm.values.Len() > 0 {
-		if c.tsm.pos == c.tsm.values.Len() {
-			c.tsm.pos--
-		} else if c.tsm.values.Timestamps[c.tsm.pos] != seek {
-			c.tsm.pos--
-		}
-	} else {
-		c.tsm.pos = -1
-	}
+	c.tsm.pos--
 }
 
 func (c *floatArrayDescendingCursor) Err() error { return nil }
+
+func (c *floatArrayDescendingCursor) Stats() tsdb.CursorStats {
+	return tsdb.CursorStats{}
+}
 
 func (c *floatArrayDescendingCursor) Close() {
 	if c.tsm.keyCursor != nil {
@@ -338,6 +332,10 @@ func (c *integerArrayAscendingCursor) reset(seek, end int64, cacheValues Values,
 
 func (c *integerArrayAscendingCursor) Err() error { return nil }
 
+func (c *integerArrayAscendingCursor) Stats() tsdb.CursorStats {
+	return tsdb.CursorStats{}
+}
+
 // close closes the cursor and any dependent cursors.
 func (c *integerArrayAscendingCursor) Close() {
 	if c.tsm.keyCursor != nil {
@@ -384,8 +382,10 @@ func (c *integerArrayAscendingCursor) Next() *tsdb.IntegerArray {
 
 	if pos < len(c.res.Timestamps) {
 		if c.tsm.pos < len(tvals.Timestamps) {
-			if pos == 0 {
-				// optimization: all points served from TSM data
+			if pos == 0 && len(c.res.Timestamps) >= len(tvals.Timestamps) {
+				// optimization: all points can be served from TSM data because
+				// we need the entire block and the block completely fits within
+				// the buffer.
 				copy(c.res.Timestamps, tvals.Timestamps)
 				pos += copy(c.res.Values, tvals.Values)
 				c.nextTSM()
@@ -412,9 +412,9 @@ func (c *integerArrayAscendingCursor) Next() *tsdb.IntegerArray {
 		}
 	}
 
-	if pos > 0 && c.res.Timestamps[pos-1] > c.end {
+	if pos > 0 && c.res.Timestamps[pos-1] >= c.end {
 		pos -= 2
-		for pos >= 0 && c.res.Timestamps[pos] > c.end {
+		for pos >= 0 && c.res.Timestamps[pos] >= c.end {
 			pos--
 		}
 		pos++
@@ -461,36 +461,24 @@ func newIntegerArrayDescendingCursor() *integerArrayDescendingCursor {
 func (c *integerArrayDescendingCursor) reset(seek, end int64, cacheValues Values, tsmKeyCursor *KeyCursor) {
 	c.end = end
 	c.cache.values = cacheValues
-	if len(c.cache.values) > 0 {
-		c.cache.pos = sort.Search(len(c.cache.values), func(i int) bool {
-			return c.cache.values[i].UnixNano() >= seek
-		})
-		if c.cache.pos == len(c.cache.values) {
-			c.cache.pos--
-		} else if c.cache.values[c.cache.pos].UnixNano() != seek {
-			c.cache.pos--
-		}
-	} else {
-		c.cache.pos = -1
-	}
+	c.cache.pos = sort.Search(len(c.cache.values), func(i int) bool {
+		return c.cache.values[i].UnixNano() >= seek
+	})
+	c.cache.pos--
 
 	c.tsm.keyCursor = tsmKeyCursor
 	c.tsm.values, _ = c.tsm.keyCursor.ReadIntegerArrayBlock(c.tsm.buf)
 	c.tsm.pos = sort.Search(c.tsm.values.Len(), func(i int) bool {
 		return c.tsm.values.Timestamps[i] >= seek
 	})
-	if c.tsm.values.Len() > 0 {
-		if c.tsm.pos == c.tsm.values.Len() {
-			c.tsm.pos--
-		} else if c.tsm.values.Timestamps[c.tsm.pos] != seek {
-			c.tsm.pos--
-		}
-	} else {
-		c.tsm.pos = -1
-	}
+	c.tsm.pos--
 }
 
 func (c *integerArrayDescendingCursor) Err() error { return nil }
+
+func (c *integerArrayDescendingCursor) Stats() tsdb.CursorStats {
+	return tsdb.CursorStats{}
+}
 
 func (c *integerArrayDescendingCursor) Close() {
 	if c.tsm.keyCursor != nil {
@@ -621,6 +609,10 @@ func (c *unsignedArrayAscendingCursor) reset(seek, end int64, cacheValues Values
 
 func (c *unsignedArrayAscendingCursor) Err() error { return nil }
 
+func (c *unsignedArrayAscendingCursor) Stats() tsdb.CursorStats {
+	return tsdb.CursorStats{}
+}
+
 // close closes the cursor and any dependent cursors.
 func (c *unsignedArrayAscendingCursor) Close() {
 	if c.tsm.keyCursor != nil {
@@ -667,8 +659,10 @@ func (c *unsignedArrayAscendingCursor) Next() *tsdb.UnsignedArray {
 
 	if pos < len(c.res.Timestamps) {
 		if c.tsm.pos < len(tvals.Timestamps) {
-			if pos == 0 {
-				// optimization: all points served from TSM data
+			if pos == 0 && len(c.res.Timestamps) >= len(tvals.Timestamps) {
+				// optimization: all points can be served from TSM data because
+				// we need the entire block and the block completely fits within
+				// the buffer.
 				copy(c.res.Timestamps, tvals.Timestamps)
 				pos += copy(c.res.Values, tvals.Values)
 				c.nextTSM()
@@ -695,9 +689,9 @@ func (c *unsignedArrayAscendingCursor) Next() *tsdb.UnsignedArray {
 		}
 	}
 
-	if pos > 0 && c.res.Timestamps[pos-1] > c.end {
+	if pos > 0 && c.res.Timestamps[pos-1] >= c.end {
 		pos -= 2
-		for pos >= 0 && c.res.Timestamps[pos] > c.end {
+		for pos >= 0 && c.res.Timestamps[pos] >= c.end {
 			pos--
 		}
 		pos++
@@ -744,36 +738,24 @@ func newUnsignedArrayDescendingCursor() *unsignedArrayDescendingCursor {
 func (c *unsignedArrayDescendingCursor) reset(seek, end int64, cacheValues Values, tsmKeyCursor *KeyCursor) {
 	c.end = end
 	c.cache.values = cacheValues
-	if len(c.cache.values) > 0 {
-		c.cache.pos = sort.Search(len(c.cache.values), func(i int) bool {
-			return c.cache.values[i].UnixNano() >= seek
-		})
-		if c.cache.pos == len(c.cache.values) {
-			c.cache.pos--
-		} else if c.cache.values[c.cache.pos].UnixNano() != seek {
-			c.cache.pos--
-		}
-	} else {
-		c.cache.pos = -1
-	}
+	c.cache.pos = sort.Search(len(c.cache.values), func(i int) bool {
+		return c.cache.values[i].UnixNano() >= seek
+	})
+	c.cache.pos--
 
 	c.tsm.keyCursor = tsmKeyCursor
 	c.tsm.values, _ = c.tsm.keyCursor.ReadUnsignedArrayBlock(c.tsm.buf)
 	c.tsm.pos = sort.Search(c.tsm.values.Len(), func(i int) bool {
 		return c.tsm.values.Timestamps[i] >= seek
 	})
-	if c.tsm.values.Len() > 0 {
-		if c.tsm.pos == c.tsm.values.Len() {
-			c.tsm.pos--
-		} else if c.tsm.values.Timestamps[c.tsm.pos] != seek {
-			c.tsm.pos--
-		}
-	} else {
-		c.tsm.pos = -1
-	}
+	c.tsm.pos--
 }
 
 func (c *unsignedArrayDescendingCursor) Err() error { return nil }
+
+func (c *unsignedArrayDescendingCursor) Stats() tsdb.CursorStats {
+	return tsdb.CursorStats{}
+}
 
 func (c *unsignedArrayDescendingCursor) Close() {
 	if c.tsm.keyCursor != nil {
@@ -904,6 +886,10 @@ func (c *stringArrayAscendingCursor) reset(seek, end int64, cacheValues Values, 
 
 func (c *stringArrayAscendingCursor) Err() error { return nil }
 
+func (c *stringArrayAscendingCursor) Stats() tsdb.CursorStats {
+	return tsdb.CursorStats{}
+}
+
 // close closes the cursor and any dependent cursors.
 func (c *stringArrayAscendingCursor) Close() {
 	if c.tsm.keyCursor != nil {
@@ -950,8 +936,10 @@ func (c *stringArrayAscendingCursor) Next() *tsdb.StringArray {
 
 	if pos < len(c.res.Timestamps) {
 		if c.tsm.pos < len(tvals.Timestamps) {
-			if pos == 0 {
-				// optimization: all points served from TSM data
+			if pos == 0 && len(c.res.Timestamps) >= len(tvals.Timestamps) {
+				// optimization: all points can be served from TSM data because
+				// we need the entire block and the block completely fits within
+				// the buffer.
 				copy(c.res.Timestamps, tvals.Timestamps)
 				pos += copy(c.res.Values, tvals.Values)
 				c.nextTSM()
@@ -978,9 +966,9 @@ func (c *stringArrayAscendingCursor) Next() *tsdb.StringArray {
 		}
 	}
 
-	if pos > 0 && c.res.Timestamps[pos-1] > c.end {
+	if pos > 0 && c.res.Timestamps[pos-1] >= c.end {
 		pos -= 2
-		for pos >= 0 && c.res.Timestamps[pos] > c.end {
+		for pos >= 0 && c.res.Timestamps[pos] >= c.end {
 			pos--
 		}
 		pos++
@@ -1027,36 +1015,24 @@ func newStringArrayDescendingCursor() *stringArrayDescendingCursor {
 func (c *stringArrayDescendingCursor) reset(seek, end int64, cacheValues Values, tsmKeyCursor *KeyCursor) {
 	c.end = end
 	c.cache.values = cacheValues
-	if len(c.cache.values) > 0 {
-		c.cache.pos = sort.Search(len(c.cache.values), func(i int) bool {
-			return c.cache.values[i].UnixNano() >= seek
-		})
-		if c.cache.pos == len(c.cache.values) {
-			c.cache.pos--
-		} else if c.cache.values[c.cache.pos].UnixNano() != seek {
-			c.cache.pos--
-		}
-	} else {
-		c.cache.pos = -1
-	}
+	c.cache.pos = sort.Search(len(c.cache.values), func(i int) bool {
+		return c.cache.values[i].UnixNano() >= seek
+	})
+	c.cache.pos--
 
 	c.tsm.keyCursor = tsmKeyCursor
 	c.tsm.values, _ = c.tsm.keyCursor.ReadStringArrayBlock(c.tsm.buf)
 	c.tsm.pos = sort.Search(c.tsm.values.Len(), func(i int) bool {
 		return c.tsm.values.Timestamps[i] >= seek
 	})
-	if c.tsm.values.Len() > 0 {
-		if c.tsm.pos == c.tsm.values.Len() {
-			c.tsm.pos--
-		} else if c.tsm.values.Timestamps[c.tsm.pos] != seek {
-			c.tsm.pos--
-		}
-	} else {
-		c.tsm.pos = -1
-	}
+	c.tsm.pos--
 }
 
 func (c *stringArrayDescendingCursor) Err() error { return nil }
+
+func (c *stringArrayDescendingCursor) Stats() tsdb.CursorStats {
+	return tsdb.CursorStats{}
+}
 
 func (c *stringArrayDescendingCursor) Close() {
 	if c.tsm.keyCursor != nil {
@@ -1187,6 +1163,10 @@ func (c *booleanArrayAscendingCursor) reset(seek, end int64, cacheValues Values,
 
 func (c *booleanArrayAscendingCursor) Err() error { return nil }
 
+func (c *booleanArrayAscendingCursor) Stats() tsdb.CursorStats {
+	return tsdb.CursorStats{}
+}
+
 // close closes the cursor and any dependent cursors.
 func (c *booleanArrayAscendingCursor) Close() {
 	if c.tsm.keyCursor != nil {
@@ -1233,8 +1213,10 @@ func (c *booleanArrayAscendingCursor) Next() *tsdb.BooleanArray {
 
 	if pos < len(c.res.Timestamps) {
 		if c.tsm.pos < len(tvals.Timestamps) {
-			if pos == 0 {
-				// optimization: all points served from TSM data
+			if pos == 0 && len(c.res.Timestamps) >= len(tvals.Timestamps) {
+				// optimization: all points can be served from TSM data because
+				// we need the entire block and the block completely fits within
+				// the buffer.
 				copy(c.res.Timestamps, tvals.Timestamps)
 				pos += copy(c.res.Values, tvals.Values)
 				c.nextTSM()
@@ -1261,9 +1243,9 @@ func (c *booleanArrayAscendingCursor) Next() *tsdb.BooleanArray {
 		}
 	}
 
-	if pos > 0 && c.res.Timestamps[pos-1] > c.end {
+	if pos > 0 && c.res.Timestamps[pos-1] >= c.end {
 		pos -= 2
-		for pos >= 0 && c.res.Timestamps[pos] > c.end {
+		for pos >= 0 && c.res.Timestamps[pos] >= c.end {
 			pos--
 		}
 		pos++
@@ -1310,36 +1292,24 @@ func newBooleanArrayDescendingCursor() *booleanArrayDescendingCursor {
 func (c *booleanArrayDescendingCursor) reset(seek, end int64, cacheValues Values, tsmKeyCursor *KeyCursor) {
 	c.end = end
 	c.cache.values = cacheValues
-	if len(c.cache.values) > 0 {
-		c.cache.pos = sort.Search(len(c.cache.values), func(i int) bool {
-			return c.cache.values[i].UnixNano() >= seek
-		})
-		if c.cache.pos == len(c.cache.values) {
-			c.cache.pos--
-		} else if c.cache.values[c.cache.pos].UnixNano() != seek {
-			c.cache.pos--
-		}
-	} else {
-		c.cache.pos = -1
-	}
+	c.cache.pos = sort.Search(len(c.cache.values), func(i int) bool {
+		return c.cache.values[i].UnixNano() >= seek
+	})
+	c.cache.pos--
 
 	c.tsm.keyCursor = tsmKeyCursor
 	c.tsm.values, _ = c.tsm.keyCursor.ReadBooleanArrayBlock(c.tsm.buf)
 	c.tsm.pos = sort.Search(c.tsm.values.Len(), func(i int) bool {
 		return c.tsm.values.Timestamps[i] >= seek
 	})
-	if c.tsm.values.Len() > 0 {
-		if c.tsm.pos == c.tsm.values.Len() {
-			c.tsm.pos--
-		} else if c.tsm.values.Timestamps[c.tsm.pos] != seek {
-			c.tsm.pos--
-		}
-	} else {
-		c.tsm.pos = -1
-	}
+	c.tsm.pos--
 }
 
 func (c *booleanArrayDescendingCursor) Err() error { return nil }
+
+func (c *booleanArrayDescendingCursor) Stats() tsdb.CursorStats {
+	return tsdb.CursorStats{}
+}
 
 func (c *booleanArrayDescendingCursor) Close() {
 	if c.tsm.keyCursor != nil {

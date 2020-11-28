@@ -23,7 +23,7 @@ import (
 	"unsafe"
 
 	"github.com/cespare/xxhash"
-	"github.com/influxdata/influxdb/pkg/estimator"
+	"github.com/influxdata/influxdb/v2/pkg/estimator"
 )
 
 // Current version of HLL implementation.
@@ -64,7 +64,7 @@ type Plus struct {
 	tmpSet set
 
 	denseList  []uint8         // The dense representation of the HLL.
-	sparseList *compressedList // values that can be stored in the sparse represenation.
+	sparseList *compressedList // values that can be stored in the sparse representation.
 }
 
 // NewPlus returns a new Plus with precision p. p must be between 4 and 18.

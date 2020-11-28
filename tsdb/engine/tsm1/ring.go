@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/cespare/xxhash"
-	"github.com/influxdata/influxdb/pkg/bytesutil"
+	"github.com/influxdata/influxdb/v2/pkg/bytesutil"
 )
 
 // partitions is the number of partitions we used in the ring's continuum. It
@@ -84,7 +84,7 @@ func (r *ring) reset() {
 // getPartition retrieves the hash ring partition associated with the provided
 // key.
 func (r *ring) getPartition(key []byte) *partition {
-	return r.partitions[int(xxhash.Sum64(key)%partitions)]
+	return r.partitions[int(xxhash.Sum64(key)%uint64(len(r.partitions)))]
 }
 
 // entry returns the entry for the given key.

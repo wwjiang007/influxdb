@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
-	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/v2/tsdb"
 )
 
 func TestConfig_Parse(t *testing.T) {
@@ -70,6 +70,11 @@ func TestConfig_Validate_Error(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Error(err)
 	}
+
+	c.SeriesIDSetCacheSize = -1
+	if err := c.Validate(); err == nil || err.Error() != "series-id-set-cache-size must be non-negative" {
+		t.Errorf("unexpected error: %s", err)
+	}
 }
 
 func TestConfig_ByteSizes(t *testing.T) {
@@ -113,8 +118,8 @@ func TestConfig_HumanReadableSizes(t *testing.T) {
 dir = "/var/lib/influxdb/data"
 wal-dir = "/var/lib/influxdb/wal"
 wal-fsync-delay = "10s"
-cache-max-memory-size = "5g"
-cache-snapshot-memory-size = "100m"
+cache-max-memory-size = "5gib"
+cache-snapshot-memory-size = "100mib"
 `, &c); err != nil {
 		t.Fatal(err)
 	}

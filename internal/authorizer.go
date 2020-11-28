@@ -1,7 +1,7 @@
 package internal
 
 import (
-	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/v2/models"
 	"github.com/influxdata/influxql"
 )
 
@@ -19,7 +19,7 @@ func (a *AuthorizerMock) AuthorizeDatabase(p influxql.Privilege, name string) bo
 	return a.AuthorizeDatabaseFn(p, name)
 }
 
-// AuthorizeQuery determins if the query can be executed against the provided
+// AuthorizeQuery determines if the query can be executed against the provided
 // database.
 func (a *AuthorizerMock) AuthorizeQuery(database string, query *influxql.Query) error {
 	return a.AuthorizeQueryFn(database, query)

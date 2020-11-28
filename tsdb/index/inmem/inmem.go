@@ -19,13 +19,13 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/pkg/bytesutil"
-	"github.com/influxdata/influxdb/pkg/escape"
-	"github.com/influxdata/influxdb/pkg/estimator"
-	"github.com/influxdata/influxdb/pkg/estimator/hll"
-	"github.com/influxdata/influxdb/query"
-	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/v2/influxql/query"
+	"github.com/influxdata/influxdb/v2/models"
+	"github.com/influxdata/influxdb/v2/pkg/bytesutil"
+	"github.com/influxdata/influxdb/v2/pkg/escape"
+	"github.com/influxdata/influxdb/v2/pkg/estimator"
+	"github.com/influxdata/influxdb/v2/pkg/estimator/hll"
+	"github.com/influxdata/influxdb/v2/tsdb"
 	"github.com/influxdata/influxql"
 	"go.uber.org/zap"
 )
@@ -186,14 +186,26 @@ func (i *Index) MeasurementIterator() (tsdb.MeasurementIterator, error) {
 
 // CreateSeriesListIfNotExists adds the series for the given measurement to the
 // index and sets its ID or returns the existing series object
-func (i *Index) CreateSeriesListIfNotExists(seriesIDSet *tsdb.SeriesIDSet, keys, names [][]byte, tagsSlice []models.Tags, opt *tsdb.EngineOptions, ignoreLimits bool) error {
+func (i *Index) CreateSeriesListIfNotExists(seriesIDSet *tsdb.SeriesIDSet, measurements map[string]int,
+	keys, names [][]byte, tagsSlice []models.Tags, opt *tsdb.EngineOptions, ignoreLimits bool) error {
+
+	// Verify that the series will not exceed limit.
+	if !ignoreLimits {
+		i.mu.RLock()
+		if max := opt.Config.MaxSeriesPerDatabase; max > 0 && len(i.series)+len(keys) > max {
+			i.mu.RUnlock()
+			return errMaxSeriesPerDatabaseExceeded{limit: opt.Config.MaxSeriesPerDatabase}
+		}
+		i.mu.RUnlock()
+	}
+
 	seriesIDs, err := i.sfile.CreateSeriesListIfNotExists(names, tagsSlice)
 	if err != nil {
 		return err
 	}
 
 	i.mu.RLock()
-	// if there is a series for this ids, it's already been added
+	// If there is a series for this ID, it's already been added.
 	seriesList := make([]*series, len(seriesIDs))
 	for j, key := range keys {
 		seriesList[j] = i.series[string(key)]
@@ -212,6 +224,7 @@ func (i *Index) CreateSeriesListIfNotExists(seriesIDSet *tsdb.SeriesIDSet, keys,
 		seriesIDSet.Lock()
 		if !seriesIDSet.ContainsNoLock(ss.ID) {
 			seriesIDSet.AddNoLock(ss.ID)
+			measurements[ss.Measurement.Name]++
 		}
 		seriesIDSet.Unlock()
 	}
@@ -247,6 +260,7 @@ func (i *Index) CreateSeriesListIfNotExists(seriesIDSet *tsdb.SeriesIDSet, keys,
 		seriesIDSet.Lock()
 		if !seriesIDSet.ContainsNoLock(ss.ID) {
 			seriesIDSet.AddNoLock(ss.ID)
+			measurements[ss.Measurement.Name]++
 		}
 		seriesIDSet.Unlock()
 	}
@@ -254,15 +268,11 @@ func (i *Index) CreateSeriesListIfNotExists(seriesIDSet *tsdb.SeriesIDSet, keys,
 		return nil
 	}
 
-	// Verify that the series will not exceed limit.
-	if !ignoreLimits {
-		if max := opt.Config.MaxSeriesPerDatabase; max > 0 && len(i.series)+len(keys) > max {
-			return errMaxSeriesPerDatabaseExceeded{limit: opt.Config.MaxSeriesPerDatabase}
-		}
-	}
-
 	for j, key := range keys {
-		if seriesList[j] != nil {
+		// Note, keys may contain duplicates (e.g., because of points for the same series
+		// in the same batch). If the duplicate series are new, the index must
+		// be rechecked on each iteration.
+		if seriesList[j] != nil || i.series[string(key)] != nil {
 			continue
 		}
 
@@ -278,7 +288,10 @@ func (i *Index) CreateSeriesListIfNotExists(seriesIDSet *tsdb.SeriesIDSet, keys,
 		i.seriesSketch.Add(key)
 
 		// This series needs to be added to the bitset tracking undeleted series IDs.
-		seriesIDSet.Add(seriesIDs[j])
+		seriesIDSet.Lock()
+		seriesIDSet.AddNoLock(seriesIDs[j])
+		measurements[mms[j].Name]++
+		seriesIDSet.Unlock()
 	}
 
 	return nil
@@ -755,21 +768,21 @@ func (i *Index) dropMeasurement(name string) error {
 }
 
 // DropMeasurementIfSeriesNotExist drops a measurement only if there are no more
-// series for the measurment.
-func (i *Index) DropMeasurementIfSeriesNotExist(name []byte) error {
+// series for the measurement.
+func (i *Index) DropMeasurementIfSeriesNotExist(name []byte) (bool, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
 	m := i.measurements[string(name)]
 	if m == nil {
-		return nil
+		return false, nil
 	}
 
 	if m.HasSeries() {
-		return nil
+		return false, nil
 	}
 
-	return i.dropMeasurement(string(name))
+	return true, i.dropMeasurement(string(name))
 }
 
 // DropSeriesGlobal removes the series key and its tags from the index.
@@ -1054,7 +1067,9 @@ func (i *Index) Rebuild() {
 
 // assignExistingSeries assigns the existing series to shardID and returns the series, names and tags that
 // do not exists yet.
-func (i *Index) assignExistingSeries(shardID uint64, seriesIDSet *tsdb.SeriesIDSet, keys, names [][]byte, tagsSlice []models.Tags) ([][]byte, [][]byte, []models.Tags) {
+func (i *Index) assignExistingSeries(shardID uint64, seriesIDSet *tsdb.SeriesIDSet, measurements map[string]int,
+	keys, names [][]byte, tagsSlice []models.Tags) ([][]byte, [][]byte, []models.Tags) {
+
 	i.mu.RLock()
 	var n int
 	for j, key := range keys {
@@ -1070,6 +1085,7 @@ func (i *Index) assignExistingSeries(shardID uint64, seriesIDSet *tsdb.SeriesIDS
 				seriesIDSet.Lock()
 				if !seriesIDSet.ContainsNoLock(ss.ID) {
 					seriesIDSet.AddNoLock(ss.ID)
+					measurements[string(names[j])]++
 				}
 				seriesIDSet.Unlock()
 			}
@@ -1093,30 +1109,51 @@ type ShardIndex struct {
 	// Bitset storing all undeleted series IDs associated with this shard.
 	seriesIDSet *tsdb.SeriesIDSet
 
+	// mapping of measurements to the count of series ids in the set. protected
+	// by the seriesIDSet lock.
+	measurements map[string]int
+
 	opt tsdb.EngineOptions
 }
 
 // DropSeries removes the provided series id from the local bitset that tracks
 // series in this shard only.
-func (idx *ShardIndex) DropSeries(seriesID uint64, _ []byte, _ bool) error {
+func (idx *ShardIndex) DropSeries(seriesID uint64, key []byte, _ bool) error {
 	// Remove from shard-local bitset if it exists.
 	idx.seriesIDSet.Lock()
 	if idx.seriesIDSet.ContainsNoLock(seriesID) {
 		idx.seriesIDSet.RemoveNoLock(seriesID)
+
+		name := models.ParseName(key)
+		if curr := idx.measurements[string(name)]; curr <= 1 {
+			delete(idx.measurements, string(name))
+		} else {
+			idx.measurements[string(name)] = curr - 1
+		}
 	}
 	idx.seriesIDSet.Unlock()
 	return nil
 }
 
 // DropMeasurementIfSeriesNotExist drops a measurement only if there are no more
-// series for the measurment.
-func (idx *ShardIndex) DropMeasurementIfSeriesNotExist(name []byte) error {
-	return idx.Index.DropMeasurementIfSeriesNotExist(name)
+// series for the measurement.
+func (idx *ShardIndex) DropMeasurementIfSeriesNotExist(name []byte) (bool, error) {
+	idx.seriesIDSet.Lock()
+	curr := idx.measurements[string(name)]
+	idx.seriesIDSet.Unlock()
+	if curr > 0 {
+		return false, nil
+	}
+
+	// we always report the measurement was dropped if it does not exist in our
+	// measurements mapping.
+	_, err := idx.Index.DropMeasurementIfSeriesNotExist(name)
+	return err == nil, err
 }
 
 // CreateSeriesListIfNotExists creates a list of series if they doesn't exist in bulk.
 func (idx *ShardIndex) CreateSeriesListIfNotExists(keys, names [][]byte, tagsSlice []models.Tags) error {
-	keys, names, tagsSlice = idx.assignExistingSeries(idx.id, idx.seriesIDSet, keys, names, tagsSlice)
+	keys, names, tagsSlice = idx.assignExistingSeries(idx.id, idx.seriesIDSet, idx.measurements, keys, names, tagsSlice)
 	if len(keys) == 0 {
 		return nil
 	}
@@ -1165,7 +1202,7 @@ func (idx *ShardIndex) CreateSeriesListIfNotExists(keys, names [][]byte, tagsSli
 		keys, names, tagsSlice = keys[:n], names[:n], tagsSlice[:n]
 	}
 
-	if err := idx.Index.CreateSeriesListIfNotExists(idx.seriesIDSet, keys, names, tagsSlice, &idx.opt, idx.opt.Config.MaxSeriesPerDatabase == 0); err != nil {
+	if err := idx.Index.CreateSeriesListIfNotExists(idx.seriesIDSet, idx.measurements, keys, names, tagsSlice, &idx.opt, idx.opt.Config.MaxSeriesPerDatabase == 0); err != nil {
 		reason = err.Error()
 		droppedKeys = append(droppedKeys, keys...)
 	}
@@ -1174,7 +1211,7 @@ func (idx *ShardIndex) CreateSeriesListIfNotExists(keys, names [][]byte, tagsSli
 	if len(droppedKeys) > 0 {
 		dropped := len(droppedKeys) // number dropped before deduping
 		bytesutil.SortDedup(droppedKeys)
-		return &tsdb.PartialWriteError{
+		return tsdb.PartialWriteError{
 			Reason:      reason,
 			Dropped:     dropped,
 			DroppedKeys: droppedKeys,
@@ -1194,13 +1231,13 @@ func (idx *ShardIndex) SeriesN() int64 {
 // InitializeSeries is called during start-up.
 // This works the same as CreateSeriesListIfNotExists except it ignore limit errors.
 func (idx *ShardIndex) InitializeSeries(keys, names [][]byte, tags []models.Tags) error {
-	return idx.Index.CreateSeriesListIfNotExists(idx.seriesIDSet, keys, names, tags, &idx.opt, true)
+	return idx.Index.CreateSeriesListIfNotExists(idx.seriesIDSet, idx.measurements, keys, names, tags, &idx.opt, true)
 }
 
 // CreateSeriesIfNotExists creates the provided series on the index if it is not
 // already present.
 func (idx *ShardIndex) CreateSeriesIfNotExists(key, name []byte, tags models.Tags) error {
-	return idx.Index.CreateSeriesListIfNotExists(idx.seriesIDSet, [][]byte{key}, [][]byte{name}, []models.Tags{tags}, &idx.opt, false)
+	return idx.Index.CreateSeriesListIfNotExists(idx.seriesIDSet, idx.measurements, [][]byte{key}, [][]byte{name}, []models.Tags{tags}, &idx.opt, false)
 }
 
 // TagSets returns a list of tag sets based on series filtering.
@@ -1216,10 +1253,11 @@ func (idx *ShardIndex) SeriesIDSet() *tsdb.SeriesIDSet {
 // NewShardIndex returns a new index for a shard.
 func NewShardIndex(id uint64, seriesIDSet *tsdb.SeriesIDSet, opt tsdb.EngineOptions) tsdb.Index {
 	return &ShardIndex{
-		Index:       opt.InmemIndex.(*Index),
-		id:          id,
-		seriesIDSet: seriesIDSet,
-		opt:         opt,
+		Index:        opt.InmemIndex.(*Index),
+		id:           id,
+		seriesIDSet:  seriesIDSet,
+		measurements: make(map[string]int),
+		opt:          opt,
 	}
 }
 

@@ -10,14 +10,14 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/influxdata/influxdb/internal"
-	"github.com/influxdata/influxdb/logger"
-	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/pkg/slices"
-	"github.com/influxdata/influxdb/query"
-	"github.com/influxdata/influxdb/tsdb"
-	"github.com/influxdata/influxdb/tsdb/index/inmem"
-	"github.com/influxdata/influxdb/tsdb/index/tsi1"
+	"github.com/influxdata/influxdb/v2/influxql/query"
+	"github.com/influxdata/influxdb/v2/internal"
+	"github.com/influxdata/influxdb/v2/logger"
+	"github.com/influxdata/influxdb/v2/models"
+	"github.com/influxdata/influxdb/v2/pkg/slices"
+	"github.com/influxdata/influxdb/v2/tsdb"
+	"github.com/influxdata/influxdb/v2/tsdb/index/inmem"
+	"github.com/influxdata/influxdb/v2/tsdb/index/tsi1"
 	"github.com/influxdata/influxql"
 )
 
@@ -26,6 +26,7 @@ func TestMergeSeriesIDIterators(t *testing.T) {
 	itr := tsdb.MergeSeriesIDIterators(
 		tsdb.NewSeriesIDSliceIterator([]uint64{1, 2, 3}),
 		tsdb.NewSeriesIDSliceIterator(nil),
+		nil,
 		tsdb.NewSeriesIDSliceIterator([]uint64{1, 2, 3, 4}),
 	)
 
@@ -124,6 +125,96 @@ func TestIndexSet_MeasurementNamesByExpr(t *testing.T) {
 				for _, example := range authExamples {
 					t.Run(example.name, func(t *testing.T) {
 						names, err := indexes[idx].IndexSet().MeasurementNamesByExpr(authorizer, example.expr)
+						if err != nil {
+							t.Fatal(err)
+						} else if !reflect.DeepEqual(names, example.expected) {
+							t.Fatalf("got names: %v, expected %v", slices.BytesToStrings(names), slices.BytesToStrings(example.expected))
+						}
+					})
+				}
+			})
+		})
+	}
+}
+
+func TestIndexSet_MeasurementNamesByPredicate(t *testing.T) {
+	// Setup indexes
+	indexes := map[string]*Index{}
+	for _, name := range tsdb.RegisteredIndexes() {
+		idx := MustOpenNewIndex(name)
+		idx.AddSeries("cpu", map[string]string{"region": "east"})
+		idx.AddSeries("cpu", map[string]string{"region": "west", "secret": "foo"})
+		idx.AddSeries("disk", map[string]string{"secret": "foo"})
+		idx.AddSeries("mem", map[string]string{"region": "west"})
+		idx.AddSeries("gpu", map[string]string{"region": "east"})
+		idx.AddSeries("pci", map[string]string{"region": "east", "secret": "foo"})
+		indexes[name] = idx
+		defer idx.Close()
+	}
+
+	authorizer := &internal.AuthorizerMock{
+		AuthorizeSeriesReadFn: func(database string, measurement []byte, tags models.Tags) bool {
+			if tags.GetString("secret") != "" {
+				t.Logf("Rejecting series db=%s, m=%s, tags=%v", database, measurement, tags)
+				return false
+			}
+			return true
+		},
+	}
+
+	type example struct {
+		name     string
+		expr     influxql.Expr
+		expected [][]byte
+	}
+
+	// These examples should be run without any auth.
+	examples := []example{
+		{name: "all", expected: slices.StringsToBytes("cpu", "disk", "gpu", "mem", "pci")},
+		{name: "EQ", expr: influxql.MustParseExpr(`region = 'west'`), expected: slices.StringsToBytes("cpu", "mem")},
+		{name: "NEQ", expr: influxql.MustParseExpr(`region != 'west'`), expected: slices.StringsToBytes("cpu", "disk", "gpu", "pci")},
+		{name: "EQREGEX", expr: influxql.MustParseExpr(`region =~ /.*st/`), expected: slices.StringsToBytes("cpu", "gpu", "mem", "pci")},
+		{name: "NEQREGEX", expr: influxql.MustParseExpr(`region !~ /.*est/`), expected: slices.StringsToBytes("cpu", "disk", "gpu", "pci")},
+		// None of the series have this tag so all should be selected.
+		{name: "EQ empty", expr: influxql.MustParseExpr(`host = ''`), expected: slices.StringsToBytes("cpu", "disk", "gpu", "mem", "pci")},
+		// Measurements that have this tag at all should be returned.
+		{name: "NEQ empty", expr: influxql.MustParseExpr(`region != ''`), expected: slices.StringsToBytes("cpu", "gpu", "mem", "pci")},
+		{name: "EQREGEX empty", expr: influxql.MustParseExpr(`host =~ /.*/`), expected: slices.StringsToBytes("cpu", "disk", "gpu", "mem", "pci")},
+		{name: "NEQ empty", expr: influxql.MustParseExpr(`region !~ /.*/`), expected: slices.StringsToBytes()},
+	}
+
+	// These examples should be run with the authorizer.
+	authExamples := []example{
+		{name: "all", expected: slices.StringsToBytes("cpu", "gpu", "mem")},
+		{name: "EQ", expr: influxql.MustParseExpr(`region = 'west'`), expected: slices.StringsToBytes("mem")},
+		{name: "NEQ", expr: influxql.MustParseExpr(`region != 'west'`), expected: slices.StringsToBytes("cpu", "gpu")},
+		{name: "EQREGEX", expr: influxql.MustParseExpr(`region =~ /.*st/`), expected: slices.StringsToBytes("cpu", "gpu", "mem")},
+		{name: "NEQREGEX", expr: influxql.MustParseExpr(`region !~ /.*est/`), expected: slices.StringsToBytes("cpu", "gpu")},
+		{name: "EQ empty", expr: influxql.MustParseExpr(`host = ''`), expected: slices.StringsToBytes("cpu", "gpu", "mem")},
+		{name: "NEQ empty", expr: influxql.MustParseExpr(`region != ''`), expected: slices.StringsToBytes("cpu", "gpu", "mem")},
+		{name: "EQREGEX empty", expr: influxql.MustParseExpr(`host =~ /.*/`), expected: slices.StringsToBytes("cpu", "gpu", "mem")},
+		{name: "NEQ empty", expr: influxql.MustParseExpr(`region !~ /.*/`), expected: slices.StringsToBytes()},
+	}
+
+	for _, idx := range tsdb.RegisteredIndexes() {
+		t.Run(idx, func(t *testing.T) {
+			t.Run("no authorization", func(t *testing.T) {
+				for _, example := range examples {
+					t.Run(example.name, func(t *testing.T) {
+						names, err := indexes[idx].IndexSet().MeasurementNamesByPredicate(nil, example.expr)
+						if err != nil {
+							t.Fatal(err)
+						} else if !reflect.DeepEqual(names, example.expected) {
+							t.Fatalf("got names: %v, expected %v", slices.BytesToStrings(names), slices.BytesToStrings(example.expected))
+						}
+					})
+				}
+			})
+
+			t.Run("with authorization", func(t *testing.T) {
+				for _, example := range authExamples {
+					t.Run(example.name, func(t *testing.T) {
+						names, err := indexes[idx].IndexSet().MeasurementNamesByPredicate(authorizer, example.expr)
 						if err != nil {
 							t.Fatal(err)
 						} else if !reflect.DeepEqual(names, example.expected) {
@@ -277,14 +368,7 @@ func TestIndex_Sketches(t *testing.T) {
 		}
 
 		// Check cardinalities after the delete
-		switch idx.Index.(type) {
-		case *tsi1.Index:
-			checkCardinalities(t, idx, "initial|reopen|delete", 2923, 0, 10, 2)
-		case *inmem.ShardIndex:
-			checkCardinalities(t, idx, "initial|reopen|delete", 2430, 486, 10, 2)
-		default:
-			panic("unreachable")
-		}
+		checkCardinalities(t, idx, "initial|reopen|delete", 2430, 486, 10, 2)
 
 		// Re-open step only applies to the TSI index.
 		if _, ok := idx.Index.(*tsi1.Index); ok {
@@ -294,7 +378,7 @@ func TestIndex_Sketches(t *testing.T) {
 			}
 
 			// Check cardinalities after the reopen
-			checkCardinalities(t, idx, "initial|reopen|delete|reopen", 2923, 0, 10, 2)
+			checkCardinalities(t, idx, "initial|reopen|delete|reopen", 2430, 486, 10, 2)
 		}
 		return nil
 	}
@@ -316,13 +400,26 @@ type Index struct {
 	sfile     *tsdb.SeriesFile
 }
 
+type EngineOption func(opts *tsdb.EngineOptions)
+
+// DisableTSICache allows the caller to disable the TSI bitset cache during a test.
+var DisableTSICache = func() EngineOption {
+	return func(opts *tsdb.EngineOptions) {
+		opts.Config.SeriesIDSetCacheSize = 0
+	}
+}
+
 // MustNewIndex will initialize a new index using the provide type. It creates
 // everything under the same root directory so it can be cleanly removed on Close.
 //
 // The index will not be opened.
-func MustNewIndex(index string) *Index {
+func MustNewIndex(index string, eopts ...EngineOption) *Index {
 	opts := tsdb.NewEngineOptions()
 	opts.IndexVersion = index
+
+	for _, opt := range eopts {
+		opt(&opts)
+	}
 
 	rootPath, err := ioutil.TempDir("", "influxdb-tsdb")
 	if err != nil {
@@ -363,8 +460,8 @@ func MustNewIndex(index string) *Index {
 
 // MustOpenNewIndex will initialize a new index using the provide type and opens
 // it.
-func MustOpenNewIndex(index string) *Index {
-	idx := MustNewIndex(index)
+func MustOpenNewIndex(index string, opts ...EngineOption) *Index {
+	idx := MustNewIndex(index, opts...)
 	idx.MustOpen()
 	return idx
 }
@@ -591,8 +688,14 @@ func BenchmarkIndex_ConcurrentWriteQuery(b *testing.B) {
 		tags = append(tags, pt.Tags())
 	}
 
-	runBenchmark := func(b *testing.B, index string, queryN int) {
-		idx := MustOpenNewIndex(index)
+	runBenchmark := func(b *testing.B, index string, queryN int, useTSICache bool) {
+		var idx *Index
+		if !useTSICache {
+			idx = MustOpenNewIndex(index, DisableTSICache())
+		} else {
+			idx = MustOpenNewIndex(index)
+		}
+
 		var wg sync.WaitGroup
 		begin := make(chan struct{})
 
@@ -665,13 +768,11 @@ func BenchmarkIndex_ConcurrentWriteQuery(b *testing.B) {
 			for _, queryN := range queries {
 				b.Run(fmt.Sprintf("queries %d", queryN), func(b *testing.B) {
 					b.Run("cache", func(b *testing.B) {
-						tsi1.EnableBitsetCache = true
-						runBenchmark(b, indexType, queryN)
+						runBenchmark(b, indexType, queryN, true)
 					})
 
 					b.Run("no cache", func(b *testing.B) {
-						tsi1.EnableBitsetCache = false
-						runBenchmark(b, indexType, queryN)
+						runBenchmark(b, indexType, queryN, false)
 					})
 				})
 			}

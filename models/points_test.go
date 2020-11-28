@@ -2,6 +2,7 @@ package models_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -12,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/v2/models"
 )
 
 var (
@@ -96,28 +97,40 @@ func BenchmarkMarshal(b *testing.B) {
 		tags.HashKey()
 	}
 }
+
 func TestPoint_Tags(t *testing.T) {
 	examples := []struct {
 		Point string
 		Tags  models.Tags
+		Err   error
 	}{
-		{`cpu value=1`, models.Tags{}},
-		{"cpu,tag0=v0 value=1", models.NewTags(map[string]string{"tag0": "v0"})},
-		{"cpu,tag0=v0,tag1=v0 value=1", models.NewTags(map[string]string{"tag0": "v0", "tag1": "v0"})},
-		{`cpu,tag0=v\ 0 value=1`, models.NewTags(map[string]string{"tag0": "v 0"})},
-		{`cpu,tag0=v\ 0\ 1,tag1=v2 value=1`, models.NewTags(map[string]string{"tag0": "v 0 1", "tag1": "v2"})},
-		{`cpu,tag0=\, value=1`, models.NewTags(map[string]string{"tag0": ","})},
-		{`cpu,ta\ g0=\, value=1`, models.NewTags(map[string]string{"ta g0": ","})},
-		{`cpu,tag0=\,1 value=1`, models.NewTags(map[string]string{"tag0": ",1"})},
-		{`cpu,tag0=1\"\",t=k value=1`, models.NewTags(map[string]string{"tag0": `1\"\"`, "t": "k"})},
+		{`cpu value=1`, models.Tags{}, nil},
+		{"cpu,tag0=v0 value=1", models.NewTags(map[string]string{"tag0": "v0"}), nil},
+		{"cpu,tag0=v0,tag1=v0 value=1", models.NewTags(map[string]string{"tag0": "v0", "tag1": "v0"}), nil},
+		{`cpu,tag0=v\ 0 value=1`, models.NewTags(map[string]string{"tag0": "v 0"}), nil},
+		{`cpu,tag0=v\ 0\ 1,tag1=v2 value=1`, models.NewTags(map[string]string{"tag0": "v 0 1", "tag1": "v2"}), nil},
+		{`cpu,tag0=\, value=1`, models.NewTags(map[string]string{"tag0": ","}), nil},
+		{`cpu,ta\ g0=\, value=1`, models.NewTags(map[string]string{"ta g0": ","}), nil},
+		{`cpu,tag0=\,1 value=1`, models.NewTags(map[string]string{"tag0": ",1"}), nil},
+		{`cpu,tag0=1\"\",t=k value=1`, models.NewTags(map[string]string{"tag0": `1\"\"`, "t": "k"}), nil},
+		{"cpu,_measurement=v0,tag0=v0 value=1", nil, errors.New(`unable to parse 'cpu,_measurement=v0,tag0=v0 value=1': cannot use reserved tag key "_measurement"`)},
+		// the following are all unsorted tag keys to ensure this works for both cases
+		{"cpu,tag0=v0,_measurement=v0 value=1", nil, errors.New(`unable to parse 'cpu,tag0=v0,_measurement=v0 value=1': cannot use reserved tag key "_measurement"`)},
+		{"cpu,tag0=v0,_field=v0 value=1", nil, errors.New(`unable to parse 'cpu,tag0=v0,_field=v0 value=1': cannot use reserved tag key "_field"`)},
+		{"cpu,tag0=v0,time=v0 value=1", nil, errors.New(`unable to parse 'cpu,tag0=v0,time=v0 value=1': cannot use reserved tag key "time"`)},
 	}
 
 	for _, example := range examples {
 		t.Run(example.Point, func(t *testing.T) {
 			pts, err := models.ParsePointsString(example.Point)
 			if err != nil {
-				t.Fatal(err)
-			} else if len(pts) != 1 {
+				if !reflect.DeepEqual(example.Err, err) {
+					t.Fatalf("expected %#v, found %#v", example.Err, err)
+				}
+				return
+			}
+
+			if len(pts) != 1 {
 				t.Fatalf("parsed %d points, expected 1", len(pts))
 			}
 
@@ -125,10 +138,9 @@ func TestPoint_Tags(t *testing.T) {
 			for i := 0; i < 2; i++ {
 				tags := pts[0].Tags()
 				if !reflect.DeepEqual(tags, example.Tags) {
-					t.Fatalf("got %#v (%s), expected %#v", tags, tags.String(), example.Tags)
+					t.Fatalf("tag mismatch\ngot %s - %#v\nexp %s - %#v", tags.String(), tags, example.Tags.String(), example.Tags)
 				}
 			}
-
 		})
 	}
 }
@@ -1243,6 +1255,17 @@ func TestParsePointWithDuplicateTags(t *testing.T) {
 	}
 }
 
+func TestParsePointWithVariousTags(t *testing.T) {
+	line := "m"
+	for i := 0; i < 1000; i++ {
+		line += fmt.Sprintf(",t%d=x", i+1)
+		_, err := models.ParsePointsString(line + " v=0")
+		if err != nil {
+			t.Errorf(`ParsePoints("%s") failed`, line)
+		}
+	}
+}
+
 func TestParsePointWithStringField(t *testing.T) {
 	test(t, `cpu,host=serverA,region=us-east value=1.0,str="foo",str2="bar" 1000000000`,
 		NewTestPoint("cpu",
@@ -1785,7 +1808,7 @@ func TestParsePointsWithPrecision(t *testing.T) {
 		{
 			name:      "microsecond",
 			line:      `cpu,host=serverA,region=us-east value=1.0 946730096789012`,
-			precision: "u",
+			precision: "us",
 			exp:       "cpu,host=serverA,region=us-east value=1.0 946730096789012000",
 		},
 		{
@@ -1799,18 +1822,6 @@ func TestParsePointsWithPrecision(t *testing.T) {
 			line:      `cpu,host=serverA,region=us-east value=1.0 946730096`,
 			precision: "s",
 			exp:       "cpu,host=serverA,region=us-east value=1.0 946730096000000000",
-		},
-		{
-			name:      "minute",
-			line:      `cpu,host=serverA,region=us-east value=1.0 15778834`,
-			precision: "m",
-			exp:       "cpu,host=serverA,region=us-east value=1.0 946730040000000000",
-		},
-		{
-			name:      "hour",
-			line:      `cpu,host=serverA,region=us-east value=1.0 262980`,
-			precision: "h",
-			exp:       "cpu,host=serverA,region=us-east value=1.0 946728000000000000",
 		},
 	}
 	for _, test := range tests {
@@ -1850,7 +1861,7 @@ func TestParsePointsWithPrecisionNoTime(t *testing.T) {
 		},
 		{
 			name:      "microsecond precision",
-			precision: "u",
+			precision: "us",
 			exp:       "cpu,host=serverA,region=us-east value=1.0 946730096789012000",
 		},
 		{
@@ -1862,16 +1873,6 @@ func TestParsePointsWithPrecisionNoTime(t *testing.T) {
 			name:      "second precision",
 			precision: "s",
 			exp:       "cpu,host=serverA,region=us-east value=1.0 946730096000000000",
-		},
-		{
-			name:      "minute precision",
-			precision: "m",
-			exp:       "cpu,host=serverA,region=us-east value=1.0 946730040000000000",
-		},
-		{
-			name:      "hour precision",
-			precision: "h",
-			exp:       "cpu,host=serverA,region=us-east value=1.0 946728000000000000",
 		},
 	}
 
@@ -2037,7 +2038,7 @@ func TestPrecisionString(t *testing.T) {
 		},
 		{
 			name:      "microsecond precision",
-			precision: "u",
+			precision: "us",
 			exp:       "cpu value=1 946730096789012",
 		},
 		{
@@ -2049,16 +2050,6 @@ func TestPrecisionString(t *testing.T) {
 			name:      "second precision",
 			precision: "s",
 			exp:       "cpu value=1 946730096",
-		},
-		{
-			name:      "minute precision",
-			precision: "m",
-			exp:       "cpu value=1 15778834",
-		},
-		{
-			name:      "hour precision",
-			precision: "h",
-			exp:       "cpu value=1 262980",
 		},
 	}
 
@@ -2545,7 +2536,52 @@ func BenchmarkMakeKey(b *testing.B) {
 	}
 }
 
-func init() {
-	// Force uint support to be enabled for testing.
-	models.EnableUintSupport()
+func BenchmarkNewTagsKeyValues(b *testing.B) {
+	b.Run("sorted", func(b *testing.B) {
+		b.Run("no dupes", func(b *testing.B) {
+			kv := [][]byte{[]byte("tag0"), []byte("v0"), []byte("tag1"), []byte("v1"), []byte("tag2"), []byte("v2")}
+
+			b.Run("preallocate", func(b *testing.B) {
+				t := make(models.Tags, 3)
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					_, _ = models.NewTagsKeyValues(t, kv...)
+				}
+			})
+
+			b.Run("allocate", func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					_, _ = models.NewTagsKeyValues(nil, kv...)
+				}
+			})
+		})
+
+		b.Run("dupes", func(b *testing.B) {
+			kv := [][]byte{[]byte("tag0"), []byte("v0"), []byte("tag1"), []byte("v1"), []byte("tag1"), []byte("v1"), []byte("tag2"), []byte("v2"), []byte("tag2"), []byte("v2")}
+			b.ReportAllocs()
+
+			for i := 0; i < b.N; i++ {
+				_, _ = models.NewTagsKeyValues(nil, kv...)
+			}
+		})
+	})
+	b.Run("unsorted", func(b *testing.B) {
+		b.Run("no dupes", func(b *testing.B) {
+			kv := [][]byte{[]byte("tag1"), []byte("v1"), []byte("tag0"), []byte("v0"), []byte("tag2"), []byte("v2")}
+			b.ReportAllocs()
+
+			for i := 0; i < b.N; i++ {
+				_, _ = models.NewTagsKeyValues(nil, kv...)
+			}
+		})
+		b.Run("dupes", func(b *testing.B) {
+			kv := [][]byte{[]byte("tag1"), []byte("v1"), []byte("tag2"), []byte("v2"), []byte("tag0"), []byte("v0"), []byte("tag1"), []byte("v1"), []byte("tag2"), []byte("v2")}
+			b.ReportAllocs()
+
+			for i := 0; i < b.N; i++ {
+				_, _ = models.NewTagsKeyValues(nil, kv...)
+			}
+		})
+	})
 }

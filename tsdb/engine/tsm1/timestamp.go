@@ -27,7 +27,7 @@ package tsm1
 // next 1-10 bytes is the count of values.
 //
 // For simple8b encoding, the 4 low bits store the log10 of the scaling factor.  The next 8 bytes is the
-// first delta value stored uncompressed, the remaining bytes are 64bit words containg compressed delta
+// first delta value stored uncompressed, the remaining bytes are 64bit words containing compressed delta
 // values.
 //
 // For uncompressed encoding, the delta values are stored using 8 bytes each.
@@ -407,7 +407,7 @@ func CountTimestamps(b []byte) int {
 	case timeCompressedPackedSimple:
 		// First 9 bytes are the starting timestamp and scaling factor, skip over them
 		count, _ := simple8b.CountBytes(b[9:])
-		return count + 1 // +1 is for the first uncompressed timestamp, starting timestamep in b[1:9]
+		return count + 1 // +1 is for the first uncompressed timestamp, starting timestamp in b[1:9]
 	default:
 		return 0
 	}

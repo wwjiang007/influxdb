@@ -6,7 +6,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
+	"github.com/influxdata/influxdb/v2/tsdb/engine/tsm1"
 )
 
 func TestTombstoner_Add(t *testing.T) {
@@ -290,7 +290,7 @@ func TestTombstoner_ReadV1(t *testing.T) {
 	}
 	f.Close()
 
-	if err := os.Rename(f.Name(), f.Name()+".tombstone"); err != nil {
+	if err := os.Rename(f.Name(), f.Name()+"."+tsm1.TombstoneFileExtension); err != nil {
 		t.Fatalf("rename tombstone failed: %v", err)
 	}
 
@@ -329,7 +329,7 @@ func TestTombstoner_ReadEmptyV1(t *testing.T) {
 	f := MustTempFile(dir)
 	f.Close()
 
-	if err := os.Rename(f.Name(), f.Name()+".tombstone"); err != nil {
+	if err := os.Rename(f.Name(), f.Name()+"."+tsm1.TombstoneFileExtension); err != nil {
 		t.Fatalf("rename tombstone failed: %v", err)
 	}
 

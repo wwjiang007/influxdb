@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
-	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
+	"github.com/influxdata/influxdb/v2/tsdb/engine/tsm1"
 )
 
 func TestEncoding_FloatBlock(t *testing.T) {
@@ -313,7 +313,11 @@ func TestEncoding_Count(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		if got, exp := tsm1.BlockCount(b), 1; got != exp {
+		cnt, err := tsm1.BlockCount(b)
+		if err != nil {
+			t.Fatalf("Block is corrupted: %v", err)
+		}
+		if got, exp := cnt, 1; got != exp {
 			t.Fatalf("block count mismatch: got %v, exp %v", got, exp)
 		}
 	}

@@ -11,7 +11,7 @@ import (
 	"regexp"
 	"strconv"
 
-	"github.com/influxdata/influxdb/pkg/mmap"
+	"github.com/influxdata/influxdb/v2/pkg/mmap"
 )
 
 const (
@@ -70,6 +70,8 @@ func CreateSeriesSegment(id uint16, path string) (*SeriesSegment, error) {
 		return nil, err
 	} else if err := f.Truncate(int64(SeriesSegmentSize(id))); err != nil {
 		return nil, err
+	} else if err := f.Sync(); err != nil {
+		return nil, err
 	} else if err := f.Close(); err != nil {
 		return nil, err
 	}
@@ -112,10 +114,13 @@ func (s *SeriesSegment) Open() error {
 	return nil
 }
 
+// Path returns the file path to the segment.
+func (s *SeriesSegment) Path() string { return s.path }
+
 // InitForWrite initializes a write handle for the segment.
 // This is only used for the last segment in the series file.
 func (s *SeriesSegment) InitForWrite() (err error) {
-	// Only calculcate segment data size if writing.
+	// Only calculate segment data size if writing.
 	for s.size = uint32(SeriesSegmentHeaderSize); s.size < uint32(len(s.data)); {
 		flag, _, _, sz := ReadSeriesEntry(s.data[s.size:])
 		if !IsValidSeriesEntryFlag(flag) {
@@ -260,6 +265,48 @@ func (s *SeriesSegment) Clone() *SeriesSegment {
 	}
 }
 
+// CompactToPath rewrites the segment to a new file and removes tombstoned entries.
+func (s *SeriesSegment) CompactToPath(path string, index *SeriesIndex) error {
+	dst, err := CreateSeriesSegment(s.id, path)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	if err = dst.InitForWrite(); err != nil {
+		return err
+	}
+
+	// Iterate through the segment and write any entries to a new segment
+	// that exist in the index.
+	var buf []byte
+	if err = s.ForEachEntry(func(flag uint8, id uint64, _ int64, key []byte) error {
+		if index.IsDeleted(id) {
+			return nil // series id has been deleted from index
+		} else if flag == SeriesEntryTombstoneFlag {
+			return fmt.Errorf("[series id %d]: tombstone entry but exists in index", id)
+		}
+
+		// copy entry over to new segment
+		buf = AppendSeriesEntry(buf[:0], flag, id, key)
+		if _, err := dst.WriteLogEntry(buf); err != nil {
+			return err
+		}
+		return err
+	}); err != nil {
+		return err
+	}
+
+	// Close the segment and truncate it to its maximum size.
+	size := dst.size
+	if err := dst.Close(); err != nil {
+		return err
+	} else if err := os.Truncate(dst.path, int64(size)); err != nil {
+		return err
+	}
+	return nil
+}
+
 // CloneSeriesSegments returns a copy of a slice of segments.
 func CloneSeriesSegments(a []*SeriesSegment) []*SeriesSegment {
 	other := make([]*SeriesSegment, len(a))
@@ -301,12 +348,12 @@ func SplitSeriesOffset(offset int64) (segmentID uint16, pos uint32) {
 	return uint16((offset >> 32) & 0xFFFF), uint32(offset & 0xFFFFFFFF)
 }
 
-// IsValidSeriesSegmentFilename returns true if filename is a 4-character lowercase hexidecimal number.
+// IsValidSeriesSegmentFilename returns true if filename is a 4-character lowercase hexadecimal number.
 func IsValidSeriesSegmentFilename(filename string) bool {
 	return seriesSegmentFilenameRegex.MatchString(filename)
 }
 
-// ParseSeriesSegmentFilename returns the id represented by the hexidecimal filename.
+// ParseSeriesSegmentFilename returns the id represented by the hexadecimal filename.
 func ParseSeriesSegmentFilename(filename string) (uint16, error) {
 	i, err := strconv.ParseUint(filename, 16, 32)
 	return uint16(i), err

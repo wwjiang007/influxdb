@@ -9,7 +9,7 @@ package tsm1
 import (
 	"context"
 
-	"github.com/influxdata/influxdb/query"
+	"github.com/influxdata/influxdb/v2/influxql/query"
 )
 
 // buildFloatCursor creates a cursor for a float field.

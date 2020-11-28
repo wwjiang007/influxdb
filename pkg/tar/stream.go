@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/influxdata/influxdb/pkg/file"
+	"github.com/influxdata/influxdb/v2/pkg/file"
 )
 
 // Stream is a convenience function for creating a tar of a shard dir. It walks over the directory and subdirs,

@@ -20,13 +20,13 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/influxdata/influxdb/logger"
-	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/pkg/deep"
-	"github.com/influxdata/influxdb/query"
-	"github.com/influxdata/influxdb/tsdb"
-	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
-	"github.com/influxdata/influxdb/tsdb/index/inmem"
+	"github.com/influxdata/influxdb/v2/influxql/query"
+	"github.com/influxdata/influxdb/v2/logger"
+	"github.com/influxdata/influxdb/v2/models"
+	"github.com/influxdata/influxdb/v2/pkg/deep"
+	"github.com/influxdata/influxdb/v2/tsdb"
+	"github.com/influxdata/influxdb/v2/tsdb/engine/tsm1"
+	"github.com/influxdata/influxdb/v2/tsdb/index/inmem"
 	"github.com/influxdata/influxql"
 )
 
@@ -63,6 +63,112 @@ func TestEngine_DeleteWALLoadMetadata(t *testing.T) {
 				t.Fatalf("unexpected number of values: got: %d. exp: %d", got, exp)
 			}
 		})
+	}
+}
+
+// See https://github.com/influxdata/influxdb/v2/issues/14229
+func TestEngine_DeleteSeriesAfterCacheSnapshot(t *testing.T) {
+	for _, index := range tsdb.RegisteredIndexes() {
+		t.Run(index, func(t *testing.T) {
+			e := MustOpenEngine(index)
+			defer e.Close()
+
+			if err := e.WritePointsString(
+				`cpu,host=A value=1.1 1000000000`,
+				`cpu,host=B value=1.2 2000000000`,
+			); err != nil {
+				t.Fatalf("failed to write points: %s", err.Error())
+			}
+
+			e.MeasurementFields([]byte("cpu")).CreateFieldIfNotExists([]byte("value"), influxql.Float)
+			e.CreateSeriesIfNotExists([]byte("cpu,host=A"), []byte("cpu"), models.NewTags(map[string]string{"host": "A"}))
+			e.CreateSeriesIfNotExists([]byte("cpu,host=B"), []byte("cpu"), models.NewTags(map[string]string{"host": "B"}))
+
+			// Verify series exist.
+			n, err := seriesExist(e, "cpu", []string{"host"})
+			if err != nil {
+				t.Fatal(err)
+			} else if got, exp := n, 2; got != exp {
+				t.Fatalf("got %d points, expected %d", got, exp)
+			}
+
+			// Simulate restart of server
+			if err := e.Reopen(); err != nil {
+				t.Fatal(err)
+			}
+
+			// Snapshot the cache
+			if err := e.WriteSnapshot(); err != nil {
+				t.Fatalf("failed to snapshot: %s", err.Error())
+			}
+
+			// Verify series exist.
+			n, err = seriesExist(e, "cpu", []string{"host"})
+			if err != nil {
+				t.Fatal(err)
+			} else if got, exp := n, 2; got != exp {
+				t.Fatalf("got %d points, expected %d", got, exp)
+			}
+
+			// Delete the series
+			itr := &seriesIterator{keys: [][]byte{
+				[]byte("cpu,host=A"),
+				[]byte("cpu,host=B"),
+			},
+			}
+			if err := e.DeleteSeriesRange(itr, math.MinInt64, math.MaxInt64); err != nil {
+				t.Fatalf("failed to delete series: %s", err.Error())
+			}
+
+			// Verify the series are no longer present.
+			n, err = seriesExist(e, "cpu", []string{"host"})
+			if err != nil {
+				t.Fatal(err)
+			} else if got, exp := n, 0; got != exp {
+				t.Fatalf("got %d points, expected %d", got, exp)
+			}
+
+			// Simulate restart of server
+			if err := e.Reopen(); err != nil {
+				t.Fatal(err)
+			}
+
+			// Verify the series are no longer present.
+			n, err = seriesExist(e, "cpu", []string{"host"})
+			if err != nil {
+				t.Fatal(err)
+			} else if got, exp := n, 0; got != exp {
+				t.Fatalf("got %d points, expected %d", got, exp)
+			}
+		})
+	}
+}
+
+func seriesExist(e *Engine, m string, dims []string) (int, error) {
+	itr, err := e.CreateIterator(context.Background(), "cpu", query.IteratorOptions{
+		Expr:       influxql.MustParseExpr(`value`),
+		Dimensions: []string{"host"},
+		StartTime:  influxql.MinTime,
+		EndTime:    influxql.MaxTime,
+		Ascending:  false,
+	})
+	if err != nil {
+		return 0, err
+	} else if itr == nil {
+		return 0, nil
+	}
+	defer itr.Close()
+	fitr := itr.(query.FloatIterator)
+
+	var n int
+	for {
+		p, err := fitr.Next()
+		if err != nil {
+			return 0, err
+		} else if p == nil {
+			return n, nil
+		}
+		n++
 	}
 }
 
@@ -212,6 +318,57 @@ func TestEngine_Digest(t *testing.T) {
 type span struct {
 	key   string
 	tspan *tsm1.DigestTimeSpan
+}
+
+// Ensure engine handles concurrent calls to Digest().
+func TestEngine_Digest_Concurrent(t *testing.T) {
+	e := MustOpenEngine(inmem.IndexName)
+	defer e.Close()
+
+	if err := e.Open(); err != nil {
+		t.Fatalf("failed to open tsm1 engine: %s", err.Error())
+	}
+
+	// Create a few points.
+	points := []models.Point{
+		MustParsePointString("cpu,host=A value=1.1 1000000000"),
+		MustParsePointString("cpu,host=B value=1.2 2000000000"),
+	}
+
+	if err := e.WritePoints(points); err != nil {
+		t.Fatalf("failed to write points: %s", err.Error())
+	}
+
+	// Force a compaction.
+	e.ScheduleFullCompaction()
+
+	// Start multiple waiting goroutines, ready to call Digest().
+	start := make(chan struct{})
+	errs := make(chan error)
+	wg := &sync.WaitGroup{}
+	for n := 0; n < 100; n++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, _, err := e.Digest(); err != nil {
+				errs <- err
+			}
+		}()
+	}
+
+	// Goroutine to close errs channel after all routines have finished.
+	go func() { wg.Wait(); close(errs) }()
+
+	// Signal all goroutines to call Digest().
+	close(start)
+
+	// Check for digest errors.
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // Ensure that the engine will backup any TSM files created since the passed in time
@@ -816,7 +973,7 @@ func TestEngine_CreateIterator_TSM_Descending(t *testing.T) {
 	}
 }
 
-// Ensure engine can create an iterator with auxilary fields.
+// Ensure engine can create an iterator with auxiliary fields.
 func TestEngine_CreateIterator_Aux(t *testing.T) {
 	t.Parallel()
 
@@ -1792,7 +1949,7 @@ func TestEngine_CreateCursor_Ascending(t *testing.T) {
 				Field:     "value",
 				Ascending: true,
 				StartTime: 2,
-				EndTime:   11,
+				EndTime:   12,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -1851,7 +2008,7 @@ func TestEngine_CreateCursor_Descending(t *testing.T) {
 				Tags:      models.ParseTags([]byte("cpu,host=A")),
 				Field:     "value",
 				Ascending: false,
-				StartTime: 2,
+				StartTime: 1,
 				EndTime:   11,
 			})
 			if err != nil {
@@ -1861,11 +2018,11 @@ func TestEngine_CreateCursor_Descending(t *testing.T) {
 
 			fcur := cur.(tsdb.FloatArrayCursor)
 			a := fcur.Next()
-			if !cmp.Equal([]int64{11, 10, 3, 2}, a.Timestamps) {
-				t.Fatal("unexpect timestamps")
+			if !cmp.Equal([]int64{10, 3, 2, 1}, a.Timestamps) {
+				t.Fatalf("unexpect timestamps %v", a.Timestamps)
 			}
-			if !cmp.Equal([]float64{11.2, 10.1, 1.3, 1.2}, a.Values) {
-				t.Fatal("unexpect timestamps")
+			if !cmp.Equal([]float64{10.1, 1.3, 1.2, 1.1}, a.Values) {
+				t.Fatal("unexpect values")
 			}
 		})
 	}
@@ -2017,6 +2174,40 @@ func TestEngine_WritePoints_Reload(t *testing.T) {
 	}
 }
 
+func TestEngine_Invalid_UTF8(t *testing.T) {
+	for _, index := range tsdb.RegisteredIndexes() {
+		t.Run(index, func(t *testing.T) {
+			name := []byte{255, 112, 114, 111, 99} // A known invalid UTF-8 string
+			field := []byte{255, 110, 101, 116}    // A known invalid UTF-8 string
+			p := MustParsePointString(fmt.Sprintf("%s,host=A %s=1.1 6000000000", name, field))
+
+			e, err := NewEngine(index)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// mock the planner so compactions don't run during the test
+			e.CompactionPlan = &mockPlanner{}
+			if err := e.Open(); err != nil {
+				t.Fatal(err)
+			}
+			defer e.Close()
+
+			if err := e.CreateSeriesIfNotExists(p.Key(), p.Name(), p.Tags()); err != nil {
+				t.Fatalf("create series index error: %v", err)
+			}
+
+			if err := e.WritePoints([]models.Point{p}); err != nil {
+				t.Fatalf("failed to write points: %s", err.Error())
+			}
+
+			// Re-open the engine
+			if err := e.Reopen(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 func BenchmarkEngine_WritePoints(b *testing.B) {
 	batchSizes := []int{10, 100, 1000, 5000, 10000}
 	for _, sz := range batchSizes {

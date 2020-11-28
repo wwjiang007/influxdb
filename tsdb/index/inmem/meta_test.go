@@ -2,12 +2,15 @@ package inmem
 
 import (
 	"fmt"
+	"math/rand"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
-	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/query"
-	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/v2/influxql/query"
+	"github.com/influxdata/influxdb/v2/models"
+	"github.com/influxdata/influxdb/v2/tsdb"
 	"github.com/influxdata/influxql"
 )
 
@@ -144,6 +147,52 @@ func TestMeasurement_TagsSet_Deadlock(t *testing.T) {
 	}
 }
 
+// Ensures the tagKeyValue API contains no deadlocks or sync issues.
+func TestTagKeyValue_Concurrent(t *testing.T) {
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+	time.AfterFunc(2*time.Second, func() { close(done) })
+
+	v := newTagKeyValue()
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			rand := rand.New(rand.NewSource(int64(i)))
+			for {
+				// Continue running until time limit.
+				select {
+				case <-done:
+					return
+				default:
+				}
+
+				// Randomly choose next API.
+				switch rand.Intn(7) {
+				case 0:
+					v.bytes()
+				case 1:
+					v.Cardinality()
+				case 2:
+					v.Contains(fmt.Sprintf("%d", rand.Intn(52)+65))
+				case 3:
+					v.InsertSeriesIDByte([]byte(fmt.Sprintf("%d", rand.Intn(52)+65)), rand.Uint64()%1000)
+				case 4:
+					v.Load(fmt.Sprintf("%d", rand.Intn(52)+65))
+				case 5:
+					v.Range(func(tagValue string, a seriesIDs) bool {
+						return rand.Intn(10) == 0
+					})
+				case 6:
+					v.RangeAll(func(k string, a seriesIDs) {})
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
 func BenchmarkMeasurement_SeriesIDForExp_EQRegex(b *testing.B) {
 	m := newMeasurement("foo", "cpu")
 	for i := 0; i < 100000; i++ {
@@ -211,7 +260,7 @@ func benchmarkTagSets(b *testing.B, n int, opt query.IteratorOptions) {
 
 	for i := 0; i < n; i++ {
 		tags := map[string]string{"tag1": "value1", "tag2": "value2"}
-		s := newSeries(uint64(i), m, fmt.Sprintf("m,tag1=value1,tag2=value2"), models.NewTags(tags))
+		s := newSeries(uint64(i), m, "m,tag1=value1,tag2=value2", models.NewTags(tags))
 		ss.Add(uint64(i))
 		m.AddSeries(s)
 	}

@@ -1,3 +1,4 @@
+//lint:file-ignore SA5011 we use assertions, which don't guard
 package tsi1
 
 import (
@@ -14,12 +15,12 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/pkg/bloom"
-	"github.com/influxdata/influxdb/pkg/estimator"
-	"github.com/influxdata/influxdb/pkg/estimator/hll"
-	"github.com/influxdata/influxdb/pkg/mmap"
-	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/v2/models"
+	"github.com/influxdata/influxdb/v2/pkg/bloom"
+	"github.com/influxdata/influxdb/v2/pkg/estimator"
+	"github.com/influxdata/influxdb/v2/pkg/estimator/hll"
+	"github.com/influxdata/influxdb/v2/pkg/mmap"
+	"github.com/influxdata/influxdb/v2/tsdb"
 )
 
 // Log errors.
@@ -107,6 +108,8 @@ func (f *LogFile) bytes() int {
 
 // Open reads the log from a file and validates all the checksums.
 func (f *LogFile) Open() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if err := f.open(); err != nil {
 		f.Close()
 		return err
@@ -323,18 +326,18 @@ func (f *LogFile) DeleteMeasurement(name []byte) error {
 }
 
 // TagKeySeriesIDIterator returns a series iterator for a tag key.
-func (f *LogFile) TagKeySeriesIDIterator(name, key []byte) tsdb.SeriesIDIterator {
+func (f *LogFile) TagKeySeriesIDIterator(name, key []byte) (tsdb.SeriesIDIterator, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
 	mm, ok := f.mms[string(name)]
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
 	tk, ok := mm.tagSet[string(key)]
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
 	// Combine iterators across all tag keys.
@@ -343,10 +346,12 @@ func (f *LogFile) TagKeySeriesIDIterator(name, key []byte) tsdb.SeriesIDIterator
 		if tv.cardinality() == 0 {
 			continue
 		}
-		itrs = append(itrs, tsdb.NewSeriesIDSetIterator(tv.seriesIDSet()))
+		if itr := tsdb.NewSeriesIDSetIterator(tv.seriesIDSet()); itr != nil {
+			itrs = append(itrs, itr)
+		}
 	}
 
-	return tsdb.MergeSeriesIDIterators(itrs...)
+	return tsdb.MergeSeriesIDIterators(itrs...), nil
 }
 
 // TagKeyIterator returns a value iterator for a measurement.
@@ -363,7 +368,7 @@ func (f *LogFile) TagKeyIterator(name []byte) TagKeyIterator {
 	for _, k := range mm.tagSet {
 		a = append(a, k)
 	}
-	return newLogTagKeyIterator(a)
+	return newLogTagKeyIterator(f, a)
 }
 
 // TagKey returns a tag key element.
@@ -675,7 +680,7 @@ func (f *LogFile) execSeriesEntry(e *LogEntry) {
 	// the entire database and the server is restarted. This would cause
 	// the log to replay its insert but the key cannot be found.
 	//
-	// https://github.com/influxdata/influxdb/issues/9444
+	// https://github.com/influxdata/influxdb/v2/issues/9444
 	if seriesKey == nil {
 		return
 	}
@@ -714,6 +719,7 @@ func (f *LogFile) execSeriesEntry(e *LogEntry) {
 		}
 
 		ts.tagValues[string(v)] = tv
+
 		mm.tagSet[string(k)] = ts
 	}
 
@@ -760,6 +766,7 @@ func (f *LogFile) createMeasurementIfNotExists(name []byte) *logMeasurement {
 	mm := f.mms[string(name)]
 	if mm == nil {
 		mm = &logMeasurement{
+			f:      f,
 			name:   name,
 			tagSet: make(map[string]logTagKey),
 			series: make(map[uint64]struct{}),
@@ -1049,7 +1056,7 @@ func (f *LogFile) seriesSketches() (sketch, tSketch estimator.Sketch, err error)
 	tSketch = hll.NewDefaultPlus()
 	f.tombstoneSeriesIDSet.ForEach(func(id uint64) {
 		name, keys := f.sfile.Series(id)
-		sketch.Add(models.MakeKey(name, keys))
+		tSketch.Add(models.MakeKey(name, keys))
 	})
 	return sketch, tSketch, nil
 }
@@ -1198,6 +1205,7 @@ func (mms *logMeasurements) bytes() int {
 }
 
 type logMeasurement struct {
+	f         *LogFile
 	name      []byte
 	tagSet    map[string]logTagKey
 	deleted   bool
@@ -1298,7 +1306,7 @@ func (m *logMeasurement) Deleted() bool { return m.deleted }
 func (m *logMeasurement) createTagSetIfNotExists(key []byte) logTagKey {
 	ts, ok := m.tagSet[string(key)]
 	if !ok {
-		ts = logTagKey{name: key, tagValues: make(map[string]logTagValue)}
+		ts = logTagKey{f: m.f, name: key, tagValues: make(map[string]logTagValue)}
 	}
 	return ts
 }
@@ -1335,6 +1343,7 @@ func (itr *logMeasurementIterator) Next() (e MeasurementElem) {
 }
 
 type logTagKey struct {
+	f         *LogFile
 	name      []byte
 	deleted   bool
 	tagValues map[string]logTagValue
@@ -1356,10 +1365,13 @@ func (tk *logTagKey) Key() []byte   { return tk.name }
 func (tk *logTagKey) Deleted() bool { return tk.deleted }
 
 func (tk *logTagKey) TagValueIterator() TagValueIterator {
+	tk.f.mu.RLock()
 	a := make([]logTagValue, 0, len(tk.tagValues))
 	for _, v := range tk.tagValues {
 		a = append(a, v)
 	}
+	tk.f.mu.RUnlock()
+
 	return newLogTagValueIterator(a)
 }
 
@@ -1453,13 +1465,14 @@ func (a logTagValueSlice) Less(i, j int) bool { return bytes.Compare(a[i].name, 
 
 // logTagKeyIterator represents an iterator over a slice of tag keys.
 type logTagKeyIterator struct {
+	f *LogFile
 	a []logTagKey
 }
 
 // newLogTagKeyIterator returns a new instance of logTagKeyIterator.
-func newLogTagKeyIterator(a []logTagKey) *logTagKeyIterator {
+func newLogTagKeyIterator(f *LogFile, a []logTagKey) *logTagKeyIterator {
 	sort.Sort(logTagKeySlice(a))
-	return &logTagKeyIterator{a: a}
+	return &logTagKeyIterator{f: f, a: a}
 }
 
 // Next returns the next element in the iterator.
